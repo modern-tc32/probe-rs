@@ -18,6 +18,7 @@ const REG_SNAPSHOT: u32 = 0x680;
 const REG_PC: u32 = 0x6bc;
 const BREAKPOINT_PHYSICAL_SLOTS: usize = 4;
 const BREAKPOINT_LOGICAL_LIMIT: usize = 3;
+const BREAKPOINT_PROGRAM_SETTLE: Duration = Duration::from_millis(2);
 
 /// SWS operations required by the TC32 core implementation.
 pub trait TlsrSwsDebug {
@@ -129,7 +130,9 @@ impl<'probe> Tc32<'probe> {
             payload[slot * 4..slot * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
         self.interface
-            .write_memory(u64::from(REG_BREAKPOINTS), &payload)
+            .write_memory(u64::from(REG_BREAKPOINTS), &payload)?;
+        std::thread::sleep(BREAKPOINT_PROGRAM_SETTLE);
+        Ok(())
     }
 
     fn read_register_snapshot(&mut self) -> Result<[u32; 32], Error> {

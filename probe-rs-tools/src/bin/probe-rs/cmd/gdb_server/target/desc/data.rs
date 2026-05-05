@@ -73,7 +73,7 @@ impl TargetDescription {
             CoreType::Riscv => "riscv:rv32",
             CoreType::Riscv64 => "riscv:rv64",
             CoreType::Xtensa => "xtensa",
-            CoreType::Tc32 => "arm",
+            CoreType::Tc32 => "tc32",
         };
 
         Self {
@@ -95,6 +95,10 @@ impl TargetDescription {
 
     /// Get the target XML to sent to GDB
     pub fn get_target_xml(&self) -> String {
+        if self.arch == "tc32" {
+            return Self::tc32_target_xml();
+        }
+
         let mut target_description = r#"<?xml version="1.0"?>
         <!DOCTYPE target SYSTEM "gdb-target.dtd">
         <target version="1.0">
@@ -132,6 +136,34 @@ impl TargetDescription {
         target_description.push_str("</target>");
 
         target_description
+    }
+
+    fn tc32_target_xml() -> String {
+        r#"<?xml version="1.0"?>
+<!DOCTYPE target SYSTEM "gdb-target.dtd">
+<target>
+  <architecture>tc32</architecture>
+  <feature name="org.gnu.gdb.tc32.core">
+    <reg name="r0" bitsize="32" regnum="0" dwarf_regnum="0" group="general"/>
+    <reg name="r1" bitsize="32" regnum="1" dwarf_regnum="1" group="general"/>
+    <reg name="r2" bitsize="32" regnum="2" dwarf_regnum="2" group="general"/>
+    <reg name="r3" bitsize="32" regnum="3" dwarf_regnum="3" group="general"/>
+    <reg name="r4" bitsize="32" regnum="4" dwarf_regnum="4" group="general"/>
+    <reg name="r5" bitsize="32" regnum="5" dwarf_regnum="5" group="general"/>
+    <reg name="r6" bitsize="32" regnum="6" dwarf_regnum="6" group="general"/>
+    <reg name="r7" bitsize="32" regnum="7" dwarf_regnum="7" group="general"/>
+    <reg name="r8" bitsize="32" regnum="8" dwarf_regnum="8" group="general"/>
+    <reg name="r9" bitsize="32" regnum="9" dwarf_regnum="9" group="general"/>
+    <reg name="r10" bitsize="32" regnum="10" dwarf_regnum="10" group="general"/>
+    <reg name="r11" bitsize="32" regnum="11" dwarf_regnum="11" group="general" generic="fp"/>
+    <reg name="r12" bitsize="32" regnum="12" dwarf_regnum="12" group="general"/>
+    <reg name="r13" bitsize="32" regnum="13" dwarf_regnum="13" group="general" type="data_ptr" generic="sp"/>
+    <reg name="r14" bitsize="32" regnum="14" dwarf_regnum="14" group="general" type="code_ptr" generic="lr"/>
+    <reg name="r15" bitsize="32" regnum="15" dwarf_regnum="15" group="general" type="code_ptr" generic="pc"/>
+    <reg name="psr" bitsize="32" regnum="16" dwarf_regnum="16" group="general" generic="flags"/>
+  </feature>
+</target>"#
+            .to_string()
     }
 
     /// Add a new GDB feature
@@ -368,13 +400,14 @@ fn build_cortex_m_registers(desc: &mut TargetDescription, regs: &CoreRegisters) 
 }
 
 fn build_tc32_registers(desc: &mut TargetDescription, regs: &CoreRegisters) {
-    desc.add_gdb_feature("org.gnu.gdb.arm.core");
+    desc.add_gdb_feature("org.gnu.gdb.tc32.core");
     desc.add_registers(regs.core_registers());
-    if let Some(psr) = regs.psr() {
-        desc.add_register(psr);
-    }
-    desc.update_register_type("sp", "data_ptr");
-    desc.update_register_type("pc", "code_ptr");
+    desc.update_register_name("sp", "r13");
+    desc.update_register_name("lr", "r14");
+    desc.update_register_name("pc", "r15");
+    desc.update_register_type("r13", "data_ptr");
+    desc.update_register_type("r14", "code_ptr");
+    desc.update_register_type("r15", "code_ptr");
 }
 
 fn build_xtensa_registers(desc: &mut TargetDescription, _regs: &CoreRegisters) {

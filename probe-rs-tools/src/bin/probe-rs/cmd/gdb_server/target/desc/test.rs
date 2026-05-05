@@ -28,3 +28,15 @@ fn test_target_with_features() {
 
     insta::assert_snapshot!(description);
 }
+
+#[test]
+fn test_tc32_target_description_uses_tc32_gdb_layout() {
+    let target_desc = TargetDescription::new(CoreType::Tc32, InstructionSet::Tc32);
+    let description = target_desc.get_target_xml();
+
+    assert!(description.contains("<architecture>tc32</architecture>"));
+    assert!(description.contains(r#"<feature name="org.gnu.gdb.tc32.core">"#));
+    assert!(description.contains(r#"<reg name="r15" bitsize="32" regnum="15""#));
+    assert!(description.contains(r#"generic="pc""#));
+    assert_eq!(description.matches("<reg ").count(), 17);
+}
