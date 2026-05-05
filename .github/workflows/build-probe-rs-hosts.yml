@@ -1,0 +1,123 @@
+name: Build probe-rs host artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, staging, trying, tlsr8258-sws-debug]
+    paths:
+      - ".github/workflows/build-probe-rs-hosts.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "probe-rs/**"
+      - "probe-rs-tools/**"
+      - "probe-rs-target/**"
+      - "probe-rs-debug/**"
+      - "probe-rs-mi/**"
+      - "probe-rs-rtt/**"
+      - "probe-rs-elf/**"
+      - "target-gen/**"
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  VCPKGRS_DYNAMIC: 1
+
+jobs:
+  build:
+    name: ${{ matrix.host }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: linux-amd64
+            runs_on: ubuntu-latest
+            archive_ext: tar.gz
+            binary_name: probe-rs
+            is_windows: false
+          - host: linux-arm64
+            runs_on: ubuntu-24.04-arm
+            archive_ext: tar.gz
+            binary_name: probe-rs
+            is_windows: false
+          - host: macos-amd64
+            runs_on: macos-15-intel
+            archive_ext: tar.gz
+            binary_name: probe-rs
+            is_windows: false
+          - host: macos-arm64
+            runs_on: macos-14
+            archive_ext: tar.gz
+            binary_name: probe-rs
+            is_windows: false
+          - host: windows-amd64
+            runs_on: windows-latest
+            archive_ext: zip
+            binary_name: probe-rs.exe
+            is_windows: true
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Show Rust version
+        run: rustup show
+
+      - name: Build probe-rs CLI
+        run: cargo build --release --locked -p probe-rs-tools
+
+      - name: Verify probe-rs CLI (Unix)
+        if: ${{ !matrix.is_windows }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/release/probe-rs --version
+
+      - name: Verify probe-rs CLI (Windows)
+        if: matrix.is_windows
+        shell: pwsh
+        run: |
+          target\release\probe-rs.exe --version
+
+      - name: Package artifact (Unix)
+        if: ${{ !matrix.is_windows }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIST_DIR="$GITHUB_WORKSPACE/dist/probe-rs-${{ matrix.host }}"
+          mkdir -p "$DIST_DIR"
+          install -m 755 "target/release/${{ matrix.binary_name }}" "$DIST_DIR/${{ matrix.binary_name }}"
+          cp README.md LICENSE-APACHE LICENSE-MIT "$DIST_DIR/"
+          tar -C "$DIST_DIR" -czf "$GITHUB_WORKSPACE/probe-rs-${{ matrix.host }}.${{ matrix.archive_ext }}" .
+
+      - name: Package artifact (Windows)
+        if: matrix.is_windows
+        shell: pwsh
+        run: |
+          $distDir = Join-Path $env:GITHUB_WORKSPACE "dist/probe-rs-${{ matrix.host }}"
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+          Copy-Item -Force "target/release/${{ matrix.binary_name }}" (Join-Path $distDir "${{ matrix.binary_name }}")
+          Copy-Item -Force README.md, LICENSE-APACHE, LICENSE-MIT $distDir
+          $archive = Join-Path $env:GITHUB_WORKSPACE "probe-rs-${{ matrix.host }}.${{ matrix.archive_ext }}"
+          if (Test-Path $archive) {
+            Remove-Item -Force $archive
+          }
+          Compress-Archive -Path (Join-Path $distDir "*") -DestinationPath $archive
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: probe-rs-${{ matrix.host }}
+          path: probe-rs-${{ matrix.host }}.${{ matrix.archive_ext }}
