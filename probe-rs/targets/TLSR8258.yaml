@@ -17,7 +17,7 @@ variants:
     - main
     access:
       read: true
-      write: false
+      write: true
       execute: true
       boot: true
   - !Ram

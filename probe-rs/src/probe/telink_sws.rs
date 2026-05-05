@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::any::Any;
+
 use serialport::SerialPort;
 
 use crate::{
@@ -21,8 +24,14 @@ use crate::{
 const DEFAULT_UART_BAUD: u32 = 230_400;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SWIRE_CONFIG: [u8; 6] = [0x5a, 0x00, 0x06, 0x02, 0x00, 0x05];
+const FLASH_SECTOR_SIZE: usize = 4096;
+const FLASH_PAGE_SIZE: usize = 256;
+const MAX_FLASH_READ_SIZE: usize = 1024;
 const CMD_FUNCS: u8 = 0;
 const CMD_FLASH_READ: u8 = 1;
+const CMD_FLASH_WRITE: u8 = 2;
+const CMD_FLASH_SECT_ERASE: u8 = 3;
+const CMD_FLASH_GET_STATUS: u8 = 6;
 const CMD_SWIRE_READ: u8 = 7;
 const CMD_SWIRE_WRITE: u8 = 8;
 const CMDF_GET_VERSION: u8 = 0;
@@ -31,8 +40,30 @@ const CMDF_EXT_POWER: u8 = 3;
 const CMDF_SWIRE_ACTIVATE: u8 = 4;
 const ERR_NONE: u8 = 0;
 
+#[cfg(not(test))]
 trait Io: Read + Write + Send {}
+
+#[cfg(not(test))]
 impl<T: Read + Write + Send> Io for T {}
+
+#[cfg(test)]
+trait Io: Read + Write + Send + Any {
+    fn as_any(&self) -> &dyn Any;
+}
+
+#[cfg(test)]
+impl<T: Read + Write + Send + Any> Io for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+impl dyn Io {
+    fn downcast_ref_for_test<T: Any>(&self) -> Option<&T> {
+        self.as_any().downcast_ref::<T>()
+    }
+}
 
 /// Factory for Telink SWS programmer endpoints.
 #[derive(Debug)]
@@ -110,6 +141,17 @@ impl TelinkSws {
         })
     }
 
+    #[cfg(test)]
+    fn from_io_for_test(io: impl Io + 'static) -> Self {
+        Self {
+            endpoint: "test".to_string(),
+            io: Box::new(io),
+            speed_khz: 960,
+            attached: true,
+            io_retries: 0,
+        }
+    }
+
     fn command(&mut self, request: &[u8], expected_len: usize) -> Result<Vec<u8>, DebugProbeError> {
         let mut last_error = None;
         for _ in 0..=self.io_retries {
@@ -161,6 +203,10 @@ impl TelinkSws {
 
     fn get_version(&mut self) -> Result<Vec<u8>, DebugProbeError> {
         self.command(&[CMD_FUNCS, CMDF_GET_VERSION, 0, 0], 19)
+    }
+
+    fn response_count(response: &[u8]) -> u16 {
+        u16::from_le_bytes([response[2], response[3]])
     }
 
     fn set_swire_config(&mut self, swdiv: u8, swaddrlen: u8) -> Result<(), DebugProbeError> {
@@ -224,6 +270,75 @@ impl TelinkSws {
                 "SWS activate failed with error {}",
                 response[1]
             )));
+        }
+        Ok(())
+    }
+
+    fn read_flash_status(&mut self) -> Result<u8, DebugProbeError> {
+        let response = self.command(&[CMD_FLASH_GET_STATUS, 0, 0, 0], 7)?;
+        if Self::response_count(&response) != 1 {
+            return Err(DebugProbeError::Other(
+                "unexpected SWS flash status response length".to_string(),
+            ));
+        }
+        Ok(response[4])
+    }
+
+    fn wait_flash_ready(&mut self) -> Result<(), DebugProbeError> {
+        for _ in 0..300 {
+            if self.read_flash_status()? & 0x01 == 0 {
+                return Ok(());
+            }
+        }
+        Err(DebugProbeError::Timeout)
+    }
+
+    fn erase_sws_flash_sector(&mut self, address: u32) -> Result<(), DebugProbeError> {
+        self.command(
+            &[
+                CMD_FLASH_SECT_ERASE,
+                address as u8,
+                (address >> 8) as u8,
+                (address >> 16) as u8,
+            ],
+            6,
+        )?;
+        self.wait_flash_ready()
+    }
+
+    fn program_sws_flash_page(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError> {
+        if data.len() > FLASH_PAGE_SIZE {
+            return Err(DebugProbeError::Other(format!(
+                "SWS flash write block too large: {}",
+                data.len()
+            )));
+        }
+
+        let mut request = vec![
+            CMD_FLASH_WRITE,
+            address as u8,
+            (address >> 8) as u8,
+            (address >> 16) as u8,
+        ];
+        request.extend_from_slice(data);
+        let response = self.command(&request, 6)?;
+        if usize::from(Self::response_count(&response)) != data.len() {
+            return Err(DebugProbeError::Other(format!(
+                "SWS programmer wrote {} flash bytes instead of {}",
+                Self::response_count(&response),
+                data.len()
+            )));
+        }
+        self.wait_flash_ready()
+    }
+
+    fn read_sws_flash_sector(
+        &mut self,
+        address: u32,
+        data: &mut [u8],
+    ) -> Result<(), DebugProbeError> {
+        for (index, chunk) in data.chunks_mut(MAX_FLASH_READ_SIZE).enumerate() {
+            self.read_sws_flash(address + (index * MAX_FLASH_READ_SIZE) as u32, chunk)?;
         }
         Ok(())
     }
@@ -332,6 +447,42 @@ impl TlsrSwsDebug for TelinkSws {
         Ok(())
     }
 
+    fn write_sws_flash(
+        &mut self,
+        mut address: u32,
+        mut data: &[u8],
+    ) -> Result<(), DebugProbeError> {
+        while !data.is_empty() {
+            let sector_start = address & !((FLASH_SECTOR_SIZE as u32) - 1);
+            let sector_offset = (address - sector_start) as usize;
+            let chunk_len = data.len().min(FLASH_SECTOR_SIZE - sector_offset);
+            let mut sector = vec![0xff; FLASH_SECTOR_SIZE];
+
+            self.read_sws_flash_sector(sector_start, &mut sector)?;
+            if sector[sector_offset..sector_offset + chunk_len] == data[..chunk_len] {
+                address += chunk_len as u32;
+                data = &data[chunk_len..];
+                continue;
+            }
+
+            sector[sector_offset..sector_offset + chunk_len].copy_from_slice(&data[..chunk_len]);
+            self.erase_sws_flash_sector(sector_start)?;
+
+            for (page_index, page) in sector.chunks(FLASH_PAGE_SIZE).enumerate() {
+                if page.iter().all(|byte| *byte == 0xff) {
+                    continue;
+                }
+                let page_address = sector_start + (page_index * FLASH_PAGE_SIZE) as u32;
+                self.program_sws_flash_page(page_address, page)?;
+            }
+
+            address += chunk_len as u32;
+            data = &data[chunk_len..];
+        }
+
+        Ok(())
+    }
+
     fn write_sws_memory(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError> {
         let mut request = vec![
             CMD_SWIRE_WRITE,
@@ -391,7 +542,11 @@ fn crc_valid(data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{crc_block, crc_valid};
+    use std::io::{Read, Write};
+
+    use crate::architecture::tc32::TlsrSwsDebug;
+
+    use super::{TelinkSws, crc_block, crc_valid};
 
     #[test]
     fn crc_block_matches_tlsr_programmer_get_version_packet() {
@@ -410,5 +565,107 @@ mod tests {
         let mut corrupted = packet;
         corrupted[2] ^= 0x01;
         assert!(!crc_valid(&corrupted));
+    }
+
+    #[test]
+    fn flash_write_preserves_unwritten_sector_bytes() {
+        let mut sector = vec![0xff; 4096];
+        sector[0] = 0x11;
+        sector[255] = 0x22;
+
+        let io = MockIo::new(vec![
+            response(0x01, &sector[0..1024], 1024),
+            response(0x01, &sector[1024..2048], 1024),
+            response(0x01, &sector[2048..3072], 1024),
+            response(0x01, &sector[3072..4096], 1024),
+            response(0x03, &[], 0),
+            response(0x06, &[0x00], 1),
+            response(0x02, &[], 256),
+            response(0x06, &[0x00], 1),
+        ]);
+        let mut probe = TelinkSws::from_io_for_test(io);
+
+        probe.write_sws_flash(0x1002, &[0xaa, 0xbb]).unwrap();
+
+        let writes = probe.io.downcast_ref_for_test::<MockIo>().unwrap().writes();
+        assert_eq!(
+            payload_without_crc(&writes[0]),
+            vec![0x01, 0x00, 0x10, 0x00, 0x00, 0x04]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[1]),
+            vec![0x01, 0x00, 0x14, 0x00, 0x00, 0x04]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[2]),
+            vec![0x01, 0x00, 0x18, 0x00, 0x00, 0x04]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[3]),
+            vec![0x01, 0x00, 0x1c, 0x00, 0x00, 0x04]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[4]),
+            vec![0x03, 0x00, 0x10, 0x00]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[5]),
+            vec![0x06, 0x00, 0x00, 0x00]
+        );
+
+        let program = payload_without_crc(&writes[6]);
+        assert_eq!(&program[..4], &[0x02, 0x00, 0x10, 0x00]);
+        assert_eq!(program[4], 0x11);
+        assert_eq!(program[4 + 2], 0xaa);
+        assert_eq!(program[4 + 3], 0xbb);
+        assert_eq!(program[4 + 255], 0x22);
+    }
+
+    fn response(command: u8, payload: &[u8], written_count: u16) -> Vec<u8> {
+        let mut response = vec![command, 0, written_count as u8, (written_count >> 8) as u8];
+        response.extend_from_slice(payload);
+        crc_block(&response)
+    }
+
+    fn payload_without_crc(packet: &[u8]) -> Vec<u8> {
+        packet[..packet.len() - 2].to_vec()
+    }
+
+    struct MockIo {
+        reads: Vec<u8>,
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl MockIo {
+        fn new(reads: Vec<Vec<u8>>) -> Self {
+            Self {
+                reads: reads.into_iter().flatten().collect(),
+                writes: Vec::new(),
+            }
+        }
+
+        fn writes(&self) -> &[Vec<u8>] {
+            &self.writes
+        }
+    }
+
+    impl Read for MockIo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let len = buf.len().min(self.reads.len());
+            buf[..len].copy_from_slice(&self.reads[..len]);
+            self.reads.drain(..len);
+            Ok(len)
+        }
+    }
+
+    impl Write for MockIo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

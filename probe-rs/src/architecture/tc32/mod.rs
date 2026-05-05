@@ -28,6 +28,9 @@ pub trait TlsrSwsDebug {
     /// Read flash over the programmer's flash-read command.
     fn read_sws_flash(&mut self, address: u32, data: &mut [u8]) -> Result<(), DebugProbeError>;
 
+    /// Erase and write flash over the programmer's flash commands.
+    fn write_sws_flash(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError>;
+
     /// Write SRAM/register-mapped memory over SWS.
     fn write_sws_memory(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError>;
 }
@@ -63,9 +66,30 @@ impl<'probe> Tc32CommunicationInterface<'probe> {
         Ok(())
     }
 
-    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<(), Error> {
-        let address = u32::try_from(address)
-            .map_err(|_| Error::Other(format!("TC32 address {address:#x} out of range")))?;
+    fn write_memory(&mut self, address: u64, mut data: &[u8]) -> Result<(), Error> {
+        let mut offset = 0usize;
+        while !data.is_empty() {
+            let chunk_addr = address
+                .checked_add(offset as u64)
+                .ok_or_else(|| Error::Other("TC32 memory address overflow".to_string()))?;
+            let chunk_addr_u32 = u32::try_from(chunk_addr)
+                .map_err(|_| Error::Other(format!("TC32 address {chunk_addr:#x} out of range")))?;
+
+            if chunk_addr < FLASH_ADDRESS_MAX {
+                let chunk_len = data.len().min((FLASH_ADDRESS_MAX - chunk_addr) as usize);
+                self.sws
+                    .write_sws_flash(chunk_addr_u32, &data[..chunk_len])?;
+                offset += chunk_len;
+                data = &data[chunk_len..];
+            } else {
+                self.sws.write_sws_memory(chunk_addr_u32, data)?;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_sws_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Error> {
         self.sws.write_sws_memory(address, data)?;
         Ok(())
     }
@@ -111,8 +135,7 @@ impl<'probe> Tc32<'probe> {
     }
 
     fn write_debug_control(&mut self, value: u8) -> Result<(), Error> {
-        self.interface
-            .write_memory(u64::from(REG_DEBUG_CONTROL), &[value])
+        self.interface.write_sws_memory(REG_DEBUG_CONTROL, &[value])
     }
 
     fn write_breakpoint_payload(&mut self) -> Result<(), Error> {
@@ -129,8 +152,7 @@ impl<'probe> Tc32<'probe> {
         for (slot, value) in encoded.iter().enumerate() {
             payload[slot * 4..slot * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
-        self.interface
-            .write_memory(u64::from(REG_BREAKPOINTS), &payload)?;
+        self.interface.write_sws_memory(REG_BREAKPOINTS, &payload)?;
         std::thread::sleep(BREAKPOINT_PROGRAM_SETTLE);
         Ok(())
     }
@@ -150,7 +172,9 @@ impl<'probe> Tc32<'probe> {
 
     fn read_register_snapshot(&mut self) -> Result<[u32; 32], Error> {
         let mut payload = [0u8; 128];
-        self.interface.sws.read_sws_memory(REG_SNAPSHOT, &mut payload)?;
+        self.interface
+            .sws
+            .read_sws_memory(REG_SNAPSHOT, &mut payload)?;
         let mut snapshot = [0u32; 32];
         for (index, chunk) in payload.chunks_exact(4).enumerate() {
             snapshot[index] = u32::from_le_bytes(chunk.try_into().unwrap());
@@ -335,8 +359,7 @@ impl CoreInterface for Tc32<'_> {
     fn step(&mut self) -> Result<CoreInformation, Error> {
         self.write_breakpoint_payload()?;
         self.write_debug_control(0x06)?;
-        self.interface
-            .write_memory(u64::from(REG_DEBUG_STEP), &[0x80])?;
+        self.interface.write_sws_memory(REG_DEBUG_STEP, &[0x80])?;
         let pc = u64::from(self.interface.read_pc()?);
         self.state.status = CoreStatus::Halted(HaltReason::Step);
         Ok(CoreInformation { pc })
@@ -458,5 +481,63 @@ impl CoreInterface for Tc32<'_> {
 
     fn spill_registers(&mut self) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn breakpoint_register_programming_uses_sws_memory_not_flash() {
+        let mut sws = FakeSws::default();
+        let mut state = Tc32CoreState::new();
+
+        {
+            let interface = Tc32CommunicationInterface::new(&mut sws);
+            let mut core = Tc32::new(interface, &mut state);
+
+            core.set_hw_breakpoint(0, 0x0000_00f4).unwrap();
+        }
+
+        assert!(sws.flash_writes.is_empty());
+        assert_eq!(sws.memory_writes.len(), 1);
+        assert_eq!(sws.memory_writes[0].0, REG_BREAKPOINTS);
+    }
+
+    #[derive(Default)]
+    struct FakeSws {
+        memory_writes: Vec<(u32, Vec<u8>)>,
+        flash_writes: Vec<(u32, Vec<u8>)>,
+    }
+
+    impl TlsrSwsDebug for FakeSws {
+        fn read_sws_memory(
+            &mut self,
+            _address: u32,
+            data: &mut [u8],
+        ) -> Result<(), DebugProbeError> {
+            data.fill(0);
+            Ok(())
+        }
+
+        fn read_sws_flash(
+            &mut self,
+            _address: u32,
+            data: &mut [u8],
+        ) -> Result<(), DebugProbeError> {
+            data.fill(0xff);
+            Ok(())
+        }
+
+        fn write_sws_flash(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError> {
+            self.flash_writes.push((address, data.to_vec()));
+            Ok(())
+        }
+
+        fn write_sws_memory(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError> {
+            self.memory_writes.push((address, data.to_vec()));
+            Ok(())
+        }
     }
 }

@@ -1,7 +1,7 @@
 use itertools::Itertools as _;
 use parking_lot::RwLock;
 use probe_rs_target::{
-    InstructionSet, MemoryRange, MemoryRegion, NvmRegion, RawFlashAlgorithm,
+    CoreType, InstructionSet, MemoryRange, MemoryRegion, NvmRegion, RawFlashAlgorithm,
     TargetDescriptionSource,
 };
 use serde_yaml::Value;
@@ -656,6 +656,7 @@ impl FlashLoader {
             }
         }
 
+        self.verify_direct_nvm_writes(session)?;
         self.verify_ram(session)?;
 
         Ok(())
@@ -720,6 +721,8 @@ impl FlashLoader {
                 options.verify,
             )?;
         }
+
+        self.commit_direct_nvm_writes(session)?;
 
         tracing::debug!("Committing RAM!");
 
@@ -799,6 +802,7 @@ impl FlashLoader {
         }
 
         if options.verify {
+            self.verify_direct_nvm_writes(session)?;
             self.verify_ram(session)?;
         }
 
@@ -880,12 +884,21 @@ impl FlashLoader {
 
             let target = session.target();
             let core = target.core_index_by_name(core_name).unwrap();
-            let algo = Self::get_flash_algorithm_for_region(
+            let algo = match Self::get_flash_algorithm_for_region(
                 &region,
                 target,
                 core_name,
                 opt_preferred_algos,
-            )?;
+            ) {
+                Ok(algo) => algo,
+                Err(FlashError::NoFlashLoaderAlgorithmAttached { .. })
+                    if Self::supports_direct_nvm_write(target, core_name) =>
+                {
+                    tracing::debug!("     -- using direct core memory writes");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             // We don't usually have more than a handful of regions, linear search should be fine.
             tracing::debug!("     -- using algorithm: {}", algo.name);
@@ -905,6 +918,95 @@ impl FlashLoader {
         }
 
         Ok(algos)
+    }
+
+    fn commit_direct_nvm_writes(&self, session: &mut Session) -> Result<(), FlashError> {
+        for region in self
+            .memory_map
+            .iter()
+            .filter_map(MemoryRegion::as_nvm_region)
+        {
+            if !self.builder.has_data_in_range(&region.range) {
+                continue;
+            }
+
+            let Some(core_name) = region.cores.first() else {
+                return Err(FlashError::NoNvmCoreAccess(region.clone()));
+            };
+
+            let target = session.target();
+            match Self::get_flash_algorithm_for_region(region, target, core_name, &[]) {
+                Ok(_) => continue,
+                Err(FlashError::NoFlashLoaderAlgorithmAttached { .. })
+                    if Self::supports_direct_nvm_write(target, core_name) => {}
+                Err(error) => return Err(error),
+            }
+
+            let core_index = target.core_index_by_name(core_name).unwrap();
+            let mut core = session.core(core_index).map_err(FlashError::Core)?;
+            if !core.core_halted().map_err(FlashError::Core)? {
+                core.halt(Duration::from_millis(500))
+                    .map_err(FlashError::Core)?;
+            }
+
+            for (address, data) in self.builder.data_in_range(&region.range) {
+                tracing::debug!(
+                    "     -- direct NVM write: {:#010X}..{:#010X} ({} bytes)",
+                    address,
+                    address + data.len() as u64,
+                    data.len()
+                );
+                core.write(address, data).map_err(FlashError::Core)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn verify_direct_nvm_writes(&self, session: &mut Session) -> Result<(), FlashError> {
+        for region in self
+            .memory_map
+            .iter()
+            .filter_map(MemoryRegion::as_nvm_region)
+        {
+            if !self.builder.has_data_in_range(&region.range) {
+                continue;
+            }
+
+            let Some(core_name) = region.cores.first() else {
+                return Err(FlashError::NoNvmCoreAccess(region.clone()));
+            };
+
+            let target = session.target();
+            match Self::get_flash_algorithm_for_region(region, target, core_name, &[]) {
+                Ok(_) => continue,
+                Err(FlashError::NoFlashLoaderAlgorithmAttached { .. })
+                    if Self::supports_direct_nvm_write(target, core_name) => {}
+                Err(error) => return Err(error),
+            }
+
+            let core_index = target.core_index_by_name(core_name).unwrap();
+            let mut core = session.core(core_index).map_err(FlashError::Core)?;
+
+            for (address, data) in self.builder.data_in_range(&region.range) {
+                let mut written_data = vec![0; data.len()];
+                core.read(address, &mut written_data)
+                    .map_err(FlashError::Core)?;
+
+                if data != &written_data {
+                    return Err(FlashError::Verify);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn supports_direct_nvm_write(target: &Target, core_name: &str) -> bool {
+        target
+            .cores
+            .iter()
+            .any(|core| core.name == core_name && core.core_type == CoreType::Tc32)
     }
 
     fn initialize(
