@@ -245,6 +245,7 @@ impl FlashAlgorithm {
             },
             CoreType::Riscv | CoreType::Riscv64 => &Self::RISCV_FLASH_BLOB_HEADER,
             CoreType::Xtensa => &Self::XTENSA_FLASH_BLOB_HEADER,
+            CoreType::Tc32 => panic!("TC32 flash algorithms are not supported"),
         }
     }
 
@@ -253,6 +254,7 @@ impl FlashAlgorithm {
             Architecture::Arm => 8,
             Architecture::Riscv => 16,
             Architecture::Xtensa => 16,
+            Architecture::Tc32 => 4,
         }
     }
 

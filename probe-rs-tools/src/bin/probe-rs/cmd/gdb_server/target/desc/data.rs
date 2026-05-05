@@ -73,6 +73,7 @@ impl TargetDescription {
             CoreType::Riscv => "riscv:rv32",
             CoreType::Riscv64 => "riscv:rv64",
             CoreType::Xtensa => "xtensa",
+            CoreType::Tc32 => "arm",
         };
 
         Self {
@@ -261,6 +262,7 @@ pub fn build_target_description(
         },
         CoreType::Riscv | CoreType::Riscv64 => build_riscv_registers(&mut desc, regs),
         CoreType::Xtensa => build_xtensa_registers(&mut desc, regs),
+        CoreType::Tc32 => build_tc32_registers(&mut desc, regs),
     };
 
     desc
@@ -363,6 +365,16 @@ fn build_cortex_m_registers(desc: &mut TargetDescription, regs: &CoreRegisters) 
 
     desc.update_register_type("SP", "data_ptr");
     desc.update_register_type("PC", "code_ptr");
+}
+
+fn build_tc32_registers(desc: &mut TargetDescription, regs: &CoreRegisters) {
+    desc.add_gdb_feature("org.gnu.gdb.arm.core");
+    desc.add_registers(regs.core_registers());
+    if let Some(psr) = regs.psr() {
+        desc.add_register(psr);
+    }
+    desc.update_register_type("sp", "data_ptr");
+    desc.update_register_type("pc", "code_ptr");
 }
 
 fn build_xtensa_registers(desc: &mut TargetDescription, _regs: &CoreRegisters) {

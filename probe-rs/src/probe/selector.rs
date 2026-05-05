@@ -6,6 +6,8 @@ use crate::probe::{DebugProbeInfo, usb_util::to_hex};
 
 use nusb::DeviceInfo;
 
+const SWS_SELECTOR_PREFIX: &str = "sws:";
+
 /// A struct to describe the way a probe should be selected.
 ///
 /// Construct this from a set of info or from a string. The
@@ -49,8 +51,37 @@ pub struct DebugProbeSelector {
 }
 
 impl DebugProbeSelector {
+    /// Create a selector for a Telink SWS programmer endpoint.
+    pub fn sws(endpoint: impl Into<String>) -> Self {
+        Self {
+            vendor_id: 0,
+            product_id: 0,
+            interface: None,
+            serial_number: Some(format!("{SWS_SELECTOR_PREFIX}{}", endpoint.into())),
+        }
+    }
+
+    /// Returns true when this selector targets a Telink SWS programmer endpoint.
+    pub fn is_sws(&self) -> bool {
+        self.vendor_id == 0
+            && self.product_id == 0
+            && self.interface.is_none()
+            && self.sws_endpoint().is_some()
+    }
+
+    /// Returns the SWS programmer endpoint for `sws:<endpoint>` selectors.
+    pub fn sws_endpoint(&self) -> Option<&str> {
+        self.serial_number
+            .as_deref()
+            .and_then(|serial| serial.strip_prefix(SWS_SELECTOR_PREFIX))
+    }
+
     /// Returns whether the given USB device info matches this selector.
     pub fn matches(&self, info: &DeviceInfo) -> bool {
+        if self.is_sws() {
+            return false;
+        }
+
         fn matches_with_interface(
             selector: &DebugProbeSelector,
             info: &DeviceInfo,
@@ -74,6 +105,10 @@ impl DebugProbeSelector {
 
     /// Check if the given probe info matches this selector.
     pub fn matches_probe(&self, info: &DebugProbeInfo) -> bool {
+        if self.is_sws() {
+            return info.serial_number.as_deref() == self.serial_number.as_deref();
+        }
+
         self.match_probe_selector(
             info.vendor_id,
             info.product_id,
@@ -122,6 +157,14 @@ impl DebugProbeSelector {
 impl std::str::FromStr for DebugProbeSelector {
     type Err = DebugProbeSelectorParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(endpoint) = s.strip_prefix(SWS_SELECTOR_PREFIX) {
+            if endpoint.is_empty() {
+                return Err(DebugProbeSelectorParseError::Format);
+            }
+
+            return Ok(DebugProbeSelector::sws(endpoint));
+        }
+
         // Split into at most 3 parts: VID, PID, Serial.
         // We limit the number of splits to allow for colons in the
         // serial number (EspJtag uses MAC address)
@@ -175,6 +218,10 @@ impl From<&DebugProbeInfo> for DebugProbeSelector {
 
 impl fmt::Display for DebugProbeSelector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(endpoint) = self.sws_endpoint() {
+            return write!(f, "{SWS_SELECTOR_PREFIX}{endpoint}");
+        }
+
         write!(f, "{:04x}:{:04x}", self.vendor_id, self.product_id)?;
         if let Some(interface) = self.interface {
             write!(f, "-{interface}")?;
@@ -340,5 +387,23 @@ mod test {
         let selector: DebugProbeSelector = "0403:6010:ABCD1234".parse().unwrap();
         assert_eq!(selector.interface, None);
         assert_eq!(selector.to_string(), "0403:6010:ABCD1234");
+    }
+
+    #[test]
+    fn sws_selector_accepts_serial_endpoint() {
+        let selector: DebugProbeSelector = "sws:/dev/cu.usbserial-10".parse().unwrap();
+
+        assert!(selector.is_sws());
+        assert_eq!(selector.sws_endpoint(), Some("/dev/cu.usbserial-10"));
+        assert_eq!(selector.to_string(), "sws:/dev/cu.usbserial-10");
+    }
+
+    #[test]
+    fn sws_selector_accepts_tcp_endpoint_with_colons() {
+        let selector: DebugProbeSelector = "sws:tcp://192.168.70.44:55555".parse().unwrap();
+
+        assert!(selector.is_sws());
+        assert_eq!(selector.sws_endpoint(), Some("tcp://192.168.70.44:55555"));
+        assert_eq!(selector.to_string(), "sws:tcp://192.168.70.44:55555");
     }
 }

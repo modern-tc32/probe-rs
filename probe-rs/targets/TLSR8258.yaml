@@ -1,0 +1,28 @@
+name: TLSR8258
+manufacturer:
+  id: 0x29
+  cc: 0x1
+variants:
+- name: TLSR8258
+  cores:
+  - name: main
+    type: tc32
+    core_access_options: !Tc32
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x00000000
+      end: 0x00080000
+    cores:
+    - main
+    access:
+      read: true
+      write: false
+      execute: true
+      boot: true
+  - !Ram
+    range:
+      start: 0x00840000
+      end: 0x00850000
+    cores:
+    - main

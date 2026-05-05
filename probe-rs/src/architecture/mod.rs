@@ -2,4 +2,5 @@
 
 pub mod arm;
 pub mod riscv;
+pub mod tc32;
 pub mod xtensa;

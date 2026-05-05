@@ -109,6 +109,7 @@ enum ArchitectureInterface {
         riscv_mem_ap_cores: Vec<Option<(FullyQualifiedApAddress, RiscvDebugInterfaceState)>>,
     },
     Jtag(Probe, Vec<JtagInterface>),
+    Tc32(Probe),
 }
 
 impl fmt::Debug for ArchitectureInterface {
@@ -122,6 +123,7 @@ impl fmt::Debug for ArchitectureInterface {
                 .debug_tuple("ArchitectureInterface::Jtag(..)")
                 .field(ifaces)
                 .finish(),
+            ArchitectureInterface::Tc32(_) => f.write_str("ArchitectureInterface::Tc32(..)"),
         }
     }
 }
@@ -171,6 +173,10 @@ impl ArchitectureInterface {
                     }
                 }
             }
+            ArchitectureInterface::Tc32(probe) => {
+                let iface = probe.try_get_tc32_interface()?;
+                combined_state.attach_tc32(target, iface)
+            }
         }
     }
 }
@@ -202,7 +208,9 @@ impl Session {
 
         // Use ARM DAP path when the target connects via SWD/DAP: either ARM cores or RISC-V cores
         // over mem-AP (e.g. RP235x_riscv).
-        let mut session = if target.default_core().memory_ap().is_some() {
+        let mut session = if target.architecture() == Architecture::Tc32 {
+            Self::attach_tc32(probe, target, attach_method, permissions, cores)?
+        } else if target.default_core().memory_ap().is_some() {
             Self::attach_arm_debug_interface(probe, target, attach_method, permissions, cores)?
         } else {
             Self::attach_jtag(probe, target, attach_method, permissions, cores)?
@@ -211,6 +219,22 @@ impl Session {
         session.clear_all_hw_breakpoints()?;
 
         Ok(session)
+    }
+
+    fn attach_tc32(
+        mut probe: Probe,
+        target: Target,
+        _attach_method: AttachMethod,
+        _permissions: Permissions,
+        cores: Vec<CombinedCoreState>,
+    ) -> Result<Self, Error> {
+        probe.attach_to_unspecified()?;
+        Ok(Session {
+            target,
+            interfaces: ArchitectureInterface::Tc32(probe),
+            cores,
+            configured_trace_sink: None,
+        })
     }
 
     fn attach_arm_debug_interface(
@@ -720,6 +744,7 @@ impl Session {
             ArchitectureInterface::Arm(state) => state.deref_mut(),
             ArchitectureInterface::ArmWithRiscv { arm, .. } => arm.deref_mut(),
             ArchitectureInterface::Jtag(..) => return Err(ArmError::NoArmTarget),
+            ArchitectureInterface::Tc32(..) => return Err(ArmError::NoArmTarget),
         };
 
         Ok(interface)
@@ -760,6 +785,7 @@ impl Session {
                 }
             }
             ArchitectureInterface::Arm(_) => Err(RiscvError::NoRiscvTarget.into()),
+            ArchitectureInterface::Tc32(_) => Err(RiscvError::NoRiscvTarget.into()),
         }
     }
 
@@ -834,6 +860,7 @@ impl Session {
             DebugSequence::Xtensa(xtensa_debug_sequence) => {
                 xtensa_debug_sequence.prepare_running_on_ram(self, vector_table_addr, core_id)
             }
+            DebugSequence::Tc32 => Ok(()),
         }
     }
 
@@ -861,6 +888,11 @@ impl Session {
             ArchitectureInterface::Jtag(..) => {
                 return Err(Error::NotImplemented(
                     "Debug Erase Sequence is not implemented for non-ARM targets.",
+                ));
+            }
+            ArchitectureInterface::Tc32(..) => {
+                return Err(Error::NotImplemented(
+                    "Debug Erase Sequence is not implemented for TC32 targets.",
                 ));
             }
         };
@@ -893,6 +925,7 @@ impl Session {
                     }
                 }
                 ArchitectureInterface::Jtag(..) => {}
+                ArchitectureInterface::Tc32(..) => {}
             },
             Err(e) => return Err(Error::Arm(e)),
         }
@@ -999,6 +1032,7 @@ impl Session {
                     Architecture::Xtensa
                 }
             }
+            ArchitectureInterface::Tc32(_) => Architecture::Tc32,
         }
     }
 

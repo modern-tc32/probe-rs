@@ -178,6 +178,8 @@ pub enum CoreAccessOptions {
     Riscv(RiscvCoreAccessOptions),
     /// Xtensa specific options
     Xtensa(XtensaCoreAccessOptions),
+    /// TC32 specific options
+    Tc32(Tc32CoreAccessOptions),
 }
 
 /// An address for AP accesses
@@ -243,3 +245,8 @@ pub struct XtensaCoreAccessOptions {
     /// The JTAG TAP index of the core's debug module
     pub jtag_tap: Option<usize>,
 }
+
+/// The data required to access a TC32 core.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Tc32CoreAccessOptions {}

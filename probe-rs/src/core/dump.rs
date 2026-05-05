@@ -9,6 +9,7 @@ use crate::architecture::riscv::registers::{RISCV_CORE_REGISTERS, RISCV_WITH_FP_
 use crate::architecture::riscv::registers64::{
     RISCV64_CORE_REGISTERS, RISCV64_WITH_FP_CORE_REGISTERS,
 };
+use crate::architecture::tc32::registers::TC32_CORE_REGISTERS;
 use crate::architecture::xtensa::arch::{Register as XtensaRegister, SpecialRegister};
 use crate::architecture::xtensa::registers::XTENSA_CORE_REGISTERS;
 use crate::{Core, CoreRegisters, CoreType, Error, InstructionSet, MemoryInterface};
@@ -402,6 +403,7 @@ impl CoreDump {
                 }
             }
             CoreType::Xtensa => &XTENSA_CORE_REGISTERS,
+            CoreType::Tc32 => &TC32_CORE_REGISTERS,
         }
     }
 }

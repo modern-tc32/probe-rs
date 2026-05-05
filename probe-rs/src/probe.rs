@@ -14,12 +14,14 @@ pub(crate) mod queue;
 mod selector;
 pub mod sifliuart;
 pub mod stlink;
+pub mod telink_sws;
 pub mod wlink;
 
 use crate::architecture::arm::sequences::{ArmDebugSequence, DefaultArmSequence};
 use crate::architecture::arm::{ArmDebugInterface, ArmError};
 use crate::architecture::arm::{RegisterAddress, SwoAccess, communication_interface::DapProbe};
 use crate::architecture::riscv::communication_interface::{RiscvError, RiscvInterfaceBuilder};
+use crate::architecture::tc32::Tc32CommunicationInterface;
 use crate::architecture::xtensa::communication_interface::{
     XtensaCommunicationInterface, XtensaDebugInterfaceState, XtensaError,
 };
@@ -53,6 +55,7 @@ static DRIVERS: LazyLock<RwLock<Vec<&'static dyn ProbeFactory>>> = LazyLock::new
         &jlink::JLinkFactory,
         &wlink::WchLinkFactory,
         &sifliuart::SifliUartFactory,
+        &telink_sws::TelinkSwsFactory,
         &glasgow::GlasgowFactory,
         &ch347usbjtag::Ch347UsbJtagFactory,
     ];
@@ -593,6 +596,12 @@ impl Probe {
         self.inner.try_as_jtag_probe()
     }
 
+    pub(crate) fn try_get_tc32_interface<'probe>(
+        &'probe mut self,
+    ) -> Result<Tc32CommunicationInterface<'probe>, DebugProbeError> {
+        self.inner.try_get_tc32_interface()
+    }
+
     /// Gets a SWO interface from the debug probe.
     ///
     /// This does not work on all probes.
@@ -769,6 +778,20 @@ pub trait DebugProbe: Any + Send + fmt::Debug {
 
     /// Check if the probe offers an interface to debug Xtensa chips.
     fn has_xtensa_interface(&self) -> bool {
+        false
+    }
+
+    /// Get the dedicated interface to debug TC32 chips.
+    fn try_get_tc32_interface<'probe>(
+        &'probe mut self,
+    ) -> Result<Tc32CommunicationInterface<'probe>, DebugProbeError> {
+        Err(DebugProbeError::InterfaceNotAvailable {
+            interface_name: "TC32",
+        })
+    }
+
+    /// Check if the probe offers an interface to debug TC32 chips.
+    fn has_tc32_interface(&self) -> bool {
         false
     }
 

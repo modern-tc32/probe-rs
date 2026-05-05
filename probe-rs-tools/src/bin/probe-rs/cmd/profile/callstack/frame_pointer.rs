@@ -193,6 +193,11 @@ fn read_frame_record_for_core(
                 AdjustedFrameRecord::new_from_frame_record_32(fr, instruction_set, last_pc)
             })
         }
+        InstructionSet::Tc32 => {
+            read_arm_riscv_32_frame_record(memory, frame_pointer, ARM32_FRAME_RECORD_OFFSET).map(
+                |fr| AdjustedFrameRecord::new_from_frame_record_32(fr, instruction_set, last_pc),
+            )
+        }
     }
 }
 
@@ -276,6 +281,7 @@ pub(crate) fn frame_pointer_stack_walk<'a>(
     // Use frame pointer on all other architectures.
     let fp_reg = match instruction_set {
         InstructionSet::Xtensa => core.stack_pointer(),
+        InstructionSet::Tc32 => core.frame_pointer(),
         _ => core.frame_pointer(),
     };
 
@@ -318,6 +324,7 @@ mod test {
         // Use frame pointer on all other architectures.
         let fp_role = match instruction_set {
             InstructionSet::Xtensa => RegisterRole::StackPointer,
+            InstructionSet::Tc32 => RegisterRole::FramePointer,
             _ => RegisterRole::FramePointer,
         };
 

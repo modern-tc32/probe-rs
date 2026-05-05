@@ -11,7 +11,8 @@ use crate::{
 };
 pub use probe_rs_target::{Architecture, CoreAccessOptions};
 use probe_rs_target::{
-    ArmCoreAccessOptions, MemoryRegion, RiscvCoreAccessOptions, XtensaCoreAccessOptions,
+    ArmCoreAccessOptions, MemoryRegion, RiscvCoreAccessOptions, Tc32CoreAccessOptions,
+    XtensaCoreAccessOptions,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -699,6 +700,9 @@ pub enum ResolvedCoreOptions {
         sequence: Arc<dyn XtensaDebugSequence>,
         options: XtensaCoreAccessOptions,
     },
+    Tc32 {
+        options: Tc32CoreAccessOptions,
+    },
 }
 
 impl ResolvedCoreOptions {
@@ -728,6 +732,7 @@ impl ResolvedCoreOptions {
                 };
                 Self::Xtensa { sequence, options }
             }
+            CoreAccessOptions::Tc32(options) => Self::Tc32 { options },
         }
     }
 
@@ -736,6 +741,7 @@ impl ResolvedCoreOptions {
             Self::Arm { options, .. } => options.jtag_tap.unwrap_or(0),
             Self::Riscv { options, .. } => options.jtag_tap.unwrap_or(0),
             Self::Xtensa { options, .. } => options.jtag_tap.unwrap_or(0),
+            Self::Tc32 { .. } => 0,
         }
     }
 }
@@ -758,6 +764,7 @@ impl std::fmt::Debug for ResolvedCoreOptions {
                 .field("sequence", &"<XtensaDebugSequence>")
                 .field("options", options)
                 .finish(),
+            Self::Tc32 { options } => f.debug_struct("Tc32").field("options", options).finish(),
         }
     }
 }

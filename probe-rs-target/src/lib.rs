@@ -20,7 +20,7 @@ pub(crate) mod serialize;
 
 pub use chip::{
     ApAddress, ArmCoreAccessOptions, Chip, Core, CoreAccessOptions, Jtag, RiscvCoreAccessOptions,
-    RiscvJtagTunnel, ScanChainElement, XtensaCoreAccessOptions,
+    RiscvJtagTunnel, ScanChainElement, Tc32CoreAccessOptions, XtensaCoreAccessOptions,
 };
 pub use chip_family::{
     Architecture, ChipFamily, CoreType, Endian, InstructionSet, TargetDescriptionSource,

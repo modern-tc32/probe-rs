@@ -7,6 +7,8 @@ use crate::{
             dp::DpAddress,
         },
         riscv::{Riscv64, RiscvCoreState, communication_interface::RiscvCommunicationInterface},
+        tc32::Tc32CommunicationInterface,
+        tc32::Tc32CoreState,
         xtensa::{XtensaCoreState, communication_interface::XtensaCommunicationInterface},
     },
 };
@@ -244,6 +246,28 @@ impl CombinedCoreState {
         ))
     }
 
+    pub(crate) fn attach_tc32<'probe>(
+        &'probe mut self,
+        target: &'probe Target,
+        interface: Tc32CommunicationInterface<'probe>,
+    ) -> Result<Core<'probe>, Error> {
+        let name = &target.cores[self.id].name;
+
+        let SpecificCoreState::Tc32(state) = &mut self.specific_state else {
+            unreachable!(
+                "The stored core state is not compatible with the TC32 architecture. \
+                This should never happen. Please file a bug if it does."
+            );
+        };
+
+        Ok(Core::new(
+            self.id,
+            name,
+            target,
+            crate::architecture::tc32::Tc32::new(interface, state),
+        ))
+    }
+
     /// Get the memory AP for this core.
     ///
     /// ## Panic
@@ -317,6 +341,8 @@ pub enum SpecificCoreState {
     Riscv64(RiscvCoreState),
     /// The state of an Xtensa core.
     Xtensa(XtensaCoreState),
+    /// The state of a TC32 core.
+    Tc32(Tc32CoreState),
 }
 
 impl SpecificCoreState {
@@ -332,6 +358,7 @@ impl SpecificCoreState {
             CoreType::Riscv => SpecificCoreState::Riscv(RiscvCoreState::new()),
             CoreType::Riscv64 => SpecificCoreState::Riscv64(RiscvCoreState::new()),
             CoreType::Xtensa => SpecificCoreState::Xtensa(XtensaCoreState::new()),
+            CoreType::Tc32 => SpecificCoreState::Tc32(Tc32CoreState::new()),
         }
     }
 
@@ -347,6 +374,7 @@ impl SpecificCoreState {
             SpecificCoreState::Riscv(_) => CoreType::Riscv,
             SpecificCoreState::Riscv64(_) => CoreType::Riscv64,
             SpecificCoreState::Xtensa(_) => CoreType::Xtensa,
+            SpecificCoreState::Tc32(_) => CoreType::Tc32,
         }
     }
 }

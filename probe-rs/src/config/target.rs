@@ -118,6 +118,7 @@ impl Target {
                 Architecture::Arm => DebugSequence::Arm(DefaultArmSequence::create()),
                 Architecture::Riscv => DebugSequence::Riscv(DefaultRiscvSequence::create()),
                 Architecture::Xtensa => DebugSequence::Xtensa(DefaultXtensaSequence::create()),
+                Architecture::Tc32 => DebugSequence::Tc32,
             }
         });
 
@@ -266,6 +267,8 @@ pub enum DebugSequence {
     Riscv(Arc<dyn RiscvDebugSequence>),
     /// An Xtensa debug sequence.
     Xtensa(Arc<dyn XtensaDebugSequence>),
+    /// A TC32 debug sequence.
+    Tc32,
 }
 
 pub(crate) trait CoreExt {
@@ -305,6 +308,7 @@ impl CoreExt for Core {
                 })
             }
             probe_rs_target::CoreAccessOptions::Xtensa(_) => None,
+            probe_rs_target::CoreAccessOptions::Tc32(_) => None,
         }
     }
 }

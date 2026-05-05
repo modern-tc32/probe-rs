@@ -51,6 +51,8 @@ pub enum CoreType {
     Riscv64,
     /// Xtensa - TODO: may need to split into NX, LX6 and LX7
     Xtensa,
+    /// Telink TC32 core.
+    Tc32,
 }
 
 impl CoreType {
@@ -88,6 +90,7 @@ impl CoreType {
         match self {
             CoreType::Riscv | CoreType::Riscv64 => Architecture::Riscv,
             CoreType::Xtensa => Architecture::Xtensa,
+            CoreType::Tc32 => Architecture::Tc32,
             _ => Architecture::Arm,
         }
     }
@@ -102,6 +105,8 @@ pub enum Architecture {
     Riscv,
     /// An Xtensa core.
     Xtensa,
+    /// A Telink TC32 core.
+    Tc32,
 }
 
 /// Instruction set used by a core
@@ -123,6 +128,8 @@ pub enum InstructionSet {
     RV64C,
     /// Xtensa instruction set
     Xtensa,
+    /// Telink TC32 instruction set
+    Tc32,
 }
 
 impl InstructionSet {
@@ -133,6 +140,7 @@ impl InstructionSet {
             "arm" => Some(InstructionSet::A32),
             "aarch64" => Some(InstructionSet::A64),
             "xtensa" => Some(InstructionSet::Xtensa),
+            "tc32" => Some(InstructionSet::Tc32),
             other => {
                 if let Some(features) = other.strip_prefix("riscv32") {
                     if features.contains('c') {
@@ -168,6 +176,7 @@ impl InstructionSet {
             InstructionSet::RV64 => 4,
             InstructionSet::RV64C => 2,
             InstructionSet::Xtensa => 2,
+            InstructionSet::Tc32 => 2,
         }
     }
     /// Get the maximum instruction size in bytes. All supported architectures have a maximum instruction size of 4 bytes.
@@ -187,6 +196,22 @@ impl InstructionSet {
             (InstructionSet::RV32C, InstructionSet::RV32)
                 | (InstructionSet::RV64C, InstructionSet::RV64)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Architecture, CoreType, InstructionSet};
+
+    #[test]
+    fn tc32_core_type_maps_to_tc32_architecture() {
+        assert_eq!(CoreType::Tc32.architecture(), Architecture::Tc32);
+    }
+
+    #[test]
+    fn tc32_instruction_set_has_variable_width_bounds() {
+        assert_eq!(InstructionSet::Tc32.get_minimum_instruction_size(), 2);
+        assert_eq!(InstructionSet::Tc32.get_maximum_instruction_size(), 4);
     }
 }
 
