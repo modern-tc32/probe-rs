@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use crate::{
-    CoreInformation, CoreInterface, CoreRegister, CoreRegisters, CoreStatus, CoreType, Error,
-    HaltReason, InstructionSet, MemoryInterface, RegisterId, RegisterValue,
+    BreakpointCause, CoreInformation, CoreInterface, CoreRegister, CoreRegisters, CoreStatus,
+    CoreType, Error, HaltReason, InstructionSet, MemoryInterface, RegisterId, RegisterValue,
     memory::MemoryNotAlignedError, probe::DebugProbeError,
 };
 
@@ -135,10 +135,22 @@ impl<'probe> Tc32<'probe> {
         Ok(())
     }
 
+    fn active_breakpoints(&self) -> impl Iterator<Item = u64> + '_ {
+        self.state
+            .hardware_breakpoints
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|_| self.state.breakpoints_enabled)
+    }
+
+    fn has_active_breakpoints(&self) -> bool {
+        self.active_breakpoints().next().is_some()
+    }
+
     fn read_register_snapshot(&mut self) -> Result<[u32; 32], Error> {
         let mut payload = [0u8; 128];
-        self.interface
-            .read_memory(u64::from(REG_SNAPSHOT), &mut payload)?;
+        self.interface.sws.read_sws_memory(REG_SNAPSHOT, &mut payload)?;
         let mut snapshot = [0u32; 32];
         for (index, chunk) in payload.chunks_exact(4).enumerate() {
             snapshot[index] = u32::from_le_bytes(chunk.try_into().unwrap());
@@ -279,6 +291,13 @@ impl CoreInterface for Tc32<'_> {
     }
 
     fn status(&mut self) -> Result<CoreStatus, Error> {
+        if matches!(self.state.status, CoreStatus::Running) {
+            let pc = u64::from(self.interface.read_pc()?);
+            if self.active_breakpoints().any(|address| address == pc) {
+                self.state.status =
+                    CoreStatus::Halted(HaltReason::Breakpoint(BreakpointCause::Hardware));
+            }
+        }
         Ok(self.state.status)
     }
 
@@ -291,7 +310,12 @@ impl CoreInterface for Tc32<'_> {
 
     fn run(&mut self) -> Result<(), Error> {
         self.write_breakpoint_payload()?;
-        self.write_debug_control(0x08)?;
+        // Vendor tools use breakpoint-go mode when armed user breakpoints are active.
+        self.write_debug_control(if self.has_active_breakpoints() {
+            0x84
+        } else {
+            0x08
+        })?;
         self.state.status = CoreStatus::Running;
         Ok(())
     }

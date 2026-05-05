@@ -1,7 +1,9 @@
 use super::{ResumeAction, RuntimeTarget};
 
-use gdbstub::target::ext::base::multithread::MultiThreadSingleStepOps;
-use gdbstub::target::ext::base::multithread::{MultiThreadResume, MultiThreadSingleStep};
+use gdbstub::target::ext::base::multithread::{
+    MultiThreadResume, MultiThreadSchedulerLocking, MultiThreadSchedulerLockingOps,
+    MultiThreadSingleStep, MultiThreadSingleStepOps,
+};
 
 impl MultiThreadResume for RuntimeTarget<'_> {
     fn resume(&mut self) -> Result<(), Self::Error> {
@@ -44,6 +46,10 @@ impl MultiThreadResume for RuntimeTarget<'_> {
     fn support_single_step(&mut self) -> Option<MultiThreadSingleStepOps<'_, Self>> {
         Some(self)
     }
+
+    fn support_scheduler_locking(&mut self) -> Option<MultiThreadSchedulerLockingOps<'_, Self>> {
+        Some(self)
+    }
 }
 
 impl MultiThreadSingleStep for RuntimeTarget<'_> {
@@ -55,6 +61,14 @@ impl MultiThreadSingleStep for RuntimeTarget<'_> {
         let core_id = tid.get() - 1;
         self.resume_action = (core_id, ResumeAction::Step);
 
+        Ok(())
+    }
+}
+
+impl MultiThreadSchedulerLocking for RuntimeTarget<'_> {
+    fn set_resume_action_scheduler_lock(&mut self) -> Result<(), Self::Error> {
+        // probe-rs maps cores to GDB threads. There is only one active resume action
+        // in this server, so scheduler locking does not need extra target state.
         Ok(())
     }
 }
