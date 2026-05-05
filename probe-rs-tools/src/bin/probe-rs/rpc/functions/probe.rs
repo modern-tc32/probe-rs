@@ -70,6 +70,33 @@ impl DebugProbeEntry {
     }
 }
 
+const SWS_SELECTOR_PREFIX: &str = "sws:";
+
+impl DebugProbeSelector {
+    fn sws_endpoint(&self) -> Option<&str> {
+        if self.vendor_id == 0 && self.product_id == 0 && self.interface.is_none() {
+            self.serial_number
+                .as_deref()
+                .and_then(|serial| serial.strip_prefix(SWS_SELECTOR_PREFIX))
+        } else {
+            None
+        }
+    }
+
+    fn as_sws_probe_entry(&self) -> Option<DebugProbeEntry> {
+        let endpoint = self.sws_endpoint()?;
+
+        Some(DebugProbeEntry {
+            identifier: format!("Telink SWS Programmer ({endpoint})"),
+            vendor_id: 0,
+            product_id: 0,
+            interface: None,
+            serial_number: format!("{SWS_SELECTOR_PREFIX}{endpoint}"),
+            probe_type: "TelinkSWS".to_string(),
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Schema)]
 pub struct ListProbesRequest {
     /// Vendor ID filter.
@@ -121,6 +148,14 @@ pub async fn select_probe(
     _header: VarHeader,
     request: SelectProbeRequest,
 ) -> SelectProbeResponse {
+    if let Some(probe) = request
+        .probe
+        .as_ref()
+        .and_then(DebugProbeSelector::as_sws_probe_entry)
+    {
+        return Ok(SelectProbeResult::Success(probe));
+    }
+
     let lister = ctx.lister();
 
     // Capture the requested interface before consuming the selector.
@@ -220,6 +255,32 @@ impl From<DebugProbeSelector> for probe_rs::probe::DebugProbeSelector {
             serial_number: selector.serial_number,
             interface: selector.interface,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DebugProbeSelector, SWS_SELECTOR_PREFIX};
+
+    #[test]
+    fn sws_selector_builds_synthetic_probe_entry() {
+        let selector = DebugProbeSelector {
+            vendor_id: 0,
+            product_id: 0,
+            interface: None,
+            serial_number: Some("sws:tcp://192.168.70.44:55555".to_string()),
+        };
+
+        let entry = selector.as_sws_probe_entry().unwrap();
+
+        assert_eq!(entry.vendor_id, 0);
+        assert_eq!(entry.product_id, 0);
+        assert_eq!(entry.interface, None);
+        assert_eq!(
+            entry.serial_number,
+            format!("{SWS_SELECTOR_PREFIX}tcp://192.168.70.44:55555")
+        );
+        assert_eq!(entry.selector().serial_number, selector.serial_number);
     }
 }
 

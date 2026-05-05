@@ -128,12 +128,7 @@ impl Cmd {
                 }
             }
         } else {
-            let mut common = self.common;
-            if common.chip.is_some() {
-                tracing::warn!("ignoring --chip option");
-                common.chip = None;
-            }
-            match cli::attach_probe(&client, common, false).await {
+            match cli::attach_probe(&client, self.common, false).await {
                 Ok(session) => println!("{}", session.target_name().await?),
                 Err(e) => {
                     eprintln!(
