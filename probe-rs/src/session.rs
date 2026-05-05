@@ -933,6 +933,16 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn tc32_erase_all_flash(&mut self) -> Result<(), Error> {
+        match &mut self.interfaces {
+            ArchitectureInterface::Tc32(probe) => {
+                probe.try_get_tc32_interface()?.erase_flash_all()?;
+                Ok(())
+            }
+            _ => Err(Error::NotImplemented("TC32 erase all flash")),
+        }
+    }
+
     /// Reads all the available ARM CoresightComponents of the currently attached target.
     ///
     /// This will recursively parse the Romtable of the attached target

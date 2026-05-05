@@ -31,6 +31,9 @@ pub trait TlsrSwsDebug {
     /// Erase and write flash over the programmer's flash commands.
     fn write_sws_flash(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError>;
 
+    /// Erase the full flash over the programmer's flash commands.
+    fn erase_sws_flash_all(&mut self) -> Result<(), DebugProbeError>;
+
     /// Write SRAM/register-mapped memory over SWS.
     fn write_sws_memory(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError>;
 }
@@ -98,6 +101,11 @@ impl<'probe> Tc32CommunicationInterface<'probe> {
         let mut bytes = [0u8; 4];
         self.sws.read_sws_memory(REG_PC, &mut bytes)?;
         Ok(u32::from_le_bytes(bytes))
+    }
+
+    pub(crate) fn erase_flash_all(&mut self) -> Result<(), Error> {
+        self.sws.erase_sws_flash_all()?;
+        Ok(())
     }
 }
 
@@ -375,11 +383,27 @@ impl CoreInterface for Tc32<'_> {
         Ok(RegisterValue::U32(value))
     }
 
-    fn write_core_reg(&mut self, address: RegisterId, _value: RegisterValue) -> Result<(), Error> {
-        Err(Error::NotImplemented(match address.0 {
-            15 => "TC32 write program counter",
-            _ => "TC32 write core register",
-        }))
+    fn write_core_reg(&mut self, address: RegisterId, value: RegisterValue) -> Result<(), Error> {
+        if address.0 != 15 {
+            return Err(Error::NotImplemented("TC32 write core register"));
+        }
+
+        if !self.core_halted()? {
+            return Err(Error::Other(
+                "TC32 program counter can only be written while halted".to_string(),
+            ));
+        }
+
+        let value: u32 = value.try_into()?;
+        self.interface
+            .write_sws_memory(REG_PC, &value.to_le_bytes())?;
+        let readback = self.interface.read_pc()?;
+        if readback != value {
+            return Err(Error::Other(format!(
+                "TC32 program counter write to {value:#x} was not accepted by hardware, read back {readback:#x}"
+            )));
+        }
+        Ok(())
     }
 
     fn available_breakpoint_units(&mut self) -> Result<u32, Error> {
@@ -505,10 +529,65 @@ mod tests {
         assert_eq!(sws.memory_writes[0].0, REG_BREAKPOINTS);
     }
 
+    #[test]
+    fn write_program_counter_uses_debug_pc_register() {
+        let mut sws = FakeSws::default();
+        sws.pc_write_readback = Some(0x1234);
+        let mut state = Tc32CoreState::new();
+        state.status = CoreStatus::Halted(HaltReason::Request);
+
+        {
+            let interface = Tc32CommunicationInterface::new(&mut sws);
+            let mut core = Tc32::new(interface, &mut state);
+
+            core.write_core_reg(RegisterId(15), RegisterValue::U32(0x1234))
+                .unwrap();
+        }
+
+        assert!(sws.flash_writes.is_empty());
+        assert_eq!(
+            sws.memory_writes,
+            vec![(REG_PC, 0x1234u32.to_le_bytes().to_vec())]
+        );
+    }
+
+    #[test]
+    fn write_program_counter_rejects_failed_hardware_readback() {
+        let mut sws = FakeSws::default();
+        sws.pc_write_readback = Some(0);
+        let mut state = Tc32CoreState::new();
+        state.status = CoreStatus::Halted(HaltReason::Request);
+
+        let interface = Tc32CommunicationInterface::new(&mut sws);
+        let mut core = Tc32::new(interface, &mut state);
+
+        assert!(
+            core.write_core_reg(RegisterId(15), RegisterValue::U32(0x1234))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn write_core_reg_rejects_non_pc_registers() {
+        let mut sws = FakeSws::default();
+        let mut state = Tc32CoreState::new();
+
+        let interface = Tc32CommunicationInterface::new(&mut sws);
+        let mut core = Tc32::new(interface, &mut state);
+
+        assert!(
+            core.write_core_reg(RegisterId(0), RegisterValue::U32(1))
+                .is_err()
+        );
+        assert!(sws.memory_writes.is_empty());
+        assert!(sws.flash_writes.is_empty());
+    }
+
     #[derive(Default)]
     struct FakeSws {
         memory_writes: Vec<(u32, Vec<u8>)>,
         flash_writes: Vec<(u32, Vec<u8>)>,
+        pc_write_readback: Option<u32>,
     }
 
     impl TlsrSwsDebug for FakeSws {
@@ -517,7 +596,14 @@ mod tests {
             _address: u32,
             data: &mut [u8],
         ) -> Result<(), DebugProbeError> {
-            data.fill(0);
+            if _address == REG_PC
+                && data.len() == 4
+                && let Some(pc) = self.pc_write_readback
+            {
+                data.copy_from_slice(&pc.to_le_bytes());
+            } else {
+                data.fill(0);
+            }
             Ok(())
         }
 
@@ -532,6 +618,10 @@ mod tests {
 
         fn write_sws_flash(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError> {
             self.flash_writes.push((address, data.to_vec()));
+            Ok(())
+        }
+
+        fn erase_sws_flash_all(&mut self) -> Result<(), DebugProbeError> {
             Ok(())
         }
 

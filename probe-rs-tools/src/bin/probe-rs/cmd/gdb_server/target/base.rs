@@ -43,7 +43,7 @@ impl MultiThreadBase for RuntimeTarget<'_> {
         let mut core = session.core(tid.get() - 1).into_target_result()?;
 
         core.write_core_reg(core.program_counter(), regs.pc)
-            .into_target_result()?;
+            .into_target_result_non_fatal()?;
 
         let mut current_regval_offset = 0;
 
@@ -68,7 +68,8 @@ impl MultiThreadBase for RuntimeTarget<'_> {
                 value += (*ch as u128) << (8 * exp);
             }
 
-            write_register_from_source(&mut core, reg.source(), value).into_target_result()?;
+            write_register_from_source(&mut core, reg.source(), value)
+                .into_target_result_non_fatal()?;
 
             current_regval_offset = current_regval_end;
 
@@ -185,7 +186,8 @@ impl SingleRegisterAccess<Tid> for RuntimeTarget<'_> {
             value += (*ch as u128) << (8 * exp);
         }
 
-        write_register_from_source(&mut core, reg.source(), value).into_target_result()?;
+        write_register_from_source(&mut core, reg.source(), value)
+            .into_target_result_non_fatal()?;
 
         Ok(())
     }

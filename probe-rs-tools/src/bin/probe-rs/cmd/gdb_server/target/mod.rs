@@ -167,7 +167,14 @@ impl<'a> RuntimeTarget<'a> {
         };
 
         let next_state = if let Some(b) = next_byte {
-            state.incoming_data(self, b)?
+            match state.incoming_data(self, b) {
+                Ok(next_state) => next_state,
+                Err(error) if is_client_nack_error(&error) => {
+                    tracing::warn!("GDB client sent an RSP NACK; closing this GDB session");
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
             *wait_time = Duration::from_millis(10);
             state.into()
@@ -188,7 +195,14 @@ impl<'a> RuntimeTarget<'a> {
         };
 
         if let Some(b) = next_byte {
-            return Ok(Some(state.incoming_data(self, b)?));
+            return match state.incoming_data(self, b) {
+                Ok(next_state) => Ok(Some(next_state)),
+                Err(error) if is_client_nack_error(&error) => {
+                    tracing::warn!("GDB client sent an RSP NACK; closing this GDB session");
+                    Ok(None)
+                }
+                Err(error) => Err(error.into()),
+            };
         }
 
         // Check for break
@@ -293,5 +307,22 @@ fn read_if_available(conn: &mut TcpStream) -> Result<Option<u8>, anyhow::Error> 
             }
         }
         Err(e) => Err(anyhow::Error::from(e)),
+    }
+}
+
+fn is_client_nack_error(error: &impl std::fmt::Display) -> bool {
+    error.to_string().contains("Client nack'd the last packet")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_client_nack_error;
+
+    #[test]
+    fn gdbstub_client_nack_error_is_recognized() {
+        assert!(is_client_nack_error(
+            &"Client nack'd the last packet, but `gdbstub` doesn't implement re-transmission."
+        ));
+        assert!(!is_client_nack_error(&"ChecksumMismatched"));
     }
 }

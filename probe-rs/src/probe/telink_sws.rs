@@ -31,6 +31,7 @@ const CMD_FUNCS: u8 = 0;
 const CMD_FLASH_READ: u8 = 1;
 const CMD_FLASH_WRITE: u8 = 2;
 const CMD_FLASH_SECT_ERASE: u8 = 3;
+const CMD_FLASH_ALL_ERASE: u8 = 4;
 const CMD_FLASH_GET_STATUS: u8 = 6;
 const CMD_SWIRE_READ: u8 = 7;
 const CMD_SWIRE_WRITE: u8 = 8;
@@ -97,6 +98,8 @@ pub struct TelinkSws {
     speed_khz: u32,
     attached: bool,
     io_retries: usize,
+    flash_erased: bool,
+    programmed_flash_ranges: Vec<std::ops::Range<u32>>,
 }
 
 impl fmt::Debug for TelinkSws {
@@ -138,6 +141,8 @@ impl TelinkSws {
             speed_khz: 960,
             attached: false,
             io_retries: 3,
+            flash_erased: false,
+            programmed_flash_ranges: Vec::new(),
         })
     }
 
@@ -149,6 +154,8 @@ impl TelinkSws {
             speed_khz: 960,
             attached: true,
             io_retries: 0,
+            flash_erased: false,
+            programmed_flash_ranges: Vec::new(),
         }
     }
 
@@ -285,7 +292,11 @@ impl TelinkSws {
     }
 
     fn wait_flash_ready(&mut self) -> Result<(), DebugProbeError> {
-        for _ in 0..300 {
+        self.wait_flash_ready_with_limit(300)
+    }
+
+    fn wait_flash_ready_with_limit(&mut self, polls: usize) -> Result<(), DebugProbeError> {
+        for _ in 0..polls {
             if self.read_flash_status()? & 0x01 == 0 {
                 return Ok(());
             }
@@ -303,7 +314,17 @@ impl TelinkSws {
             ],
             6,
         )?;
+        self.flash_erased = false;
+        self.programmed_flash_ranges.clear();
         self.wait_flash_ready()
+    }
+
+    fn erase_sws_flash_all_inner(&mut self) -> Result<(), DebugProbeError> {
+        self.command(&[CMD_FLASH_ALL_ERASE, 0, 0, 0], 6)?;
+        self.wait_flash_ready_with_limit(3000)?;
+        self.flash_erased = true;
+        self.programmed_flash_ranges.clear();
+        Ok(())
     }
 
     fn program_sws_flash_page(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError> {
@@ -337,10 +358,75 @@ impl TelinkSws {
         address: u32,
         data: &mut [u8],
     ) -> Result<(), DebugProbeError> {
+        self.read_sws_flash_range(address, data)
+    }
+
+    fn read_sws_flash_range(
+        &mut self,
+        address: u32,
+        data: &mut [u8],
+    ) -> Result<(), DebugProbeError> {
         for (index, chunk) in data.chunks_mut(MAX_FLASH_READ_SIZE).enumerate() {
             self.read_sws_flash(address + (index * MAX_FLASH_READ_SIZE) as u32, chunk)?;
         }
         Ok(())
+    }
+
+    fn program_sws_flash_range(
+        &mut self,
+        mut address: u32,
+        mut data: &[u8],
+    ) -> Result<(), DebugProbeError> {
+        while !data.is_empty() {
+            let page_offset = (address as usize) & (FLASH_PAGE_SIZE - 1);
+            let chunk_len = data.len().min(FLASH_PAGE_SIZE - page_offset);
+            let chunk = &data[..chunk_len];
+            if chunk.iter().any(|byte| *byte != 0xff) {
+                self.program_sws_flash_page(address, chunk)?;
+            }
+            address += chunk_len as u32;
+            data = &data[chunk_len..];
+        }
+        Ok(())
+    }
+
+    fn bytes_can_be_programmed_without_erase(current: &[u8], desired: &[u8]) -> bool {
+        current
+            .iter()
+            .zip(desired)
+            .all(|(current, desired)| (current & desired) == *desired)
+    }
+
+    fn attach_with_recovery(&mut self, swdiv: u8, swaddrlen: u8) -> Result<(), DebugProbeError> {
+        match self.activate(70, swdiv, swaddrlen) {
+            Ok(()) => Ok(()),
+            Err(first_error) => {
+                tracing::warn!("Initial SWS activation failed, retrying with reset: {first_error}");
+                self.set_reset_pin(true)?;
+                std::thread::sleep(Duration::from_millis(10));
+                self.set_reset_pin(false)?;
+                self.activate(100, swdiv, swaddrlen)
+            }
+        }
+    }
+
+    fn can_assume_flash_range_erased(&self, address: u32, len: usize) -> bool {
+        let Some(end) = address.checked_add(len as u32) else {
+            return false;
+        };
+        self.flash_erased
+            && self
+                .programmed_flash_ranges
+                .iter()
+                .all(|range| range.end <= address || end <= range.start)
+    }
+
+    fn mark_programmed_flash_range(&mut self, address: u32, len: usize) {
+        if let Some(end) = address.checked_add(len as u32)
+            && end > address
+        {
+            self.programmed_flash_ranges.push(address..end);
+        }
     }
 }
 
@@ -369,7 +455,7 @@ impl DebugProbe for TelinkSws {
         let swdiv = (programmer_clock_mhz / 5).max(1) as u8;
         self.set_swire_config(swdiv, 3)?;
         self.set_reset_pin(false)?;
-        self.activate(70, swdiv, 3)?;
+        self.attach_with_recovery(swdiv, 3)?;
         self.attached = true;
         Ok(())
     }
@@ -452,35 +538,59 @@ impl TlsrSwsDebug for TelinkSws {
         mut address: u32,
         mut data: &[u8],
     ) -> Result<(), DebugProbeError> {
+        if self.can_assume_flash_range_erased(address, data.len()) {
+            self.program_sws_flash_range(address, data)?;
+            self.mark_programmed_flash_range(address, data.len());
+            return Ok(());
+        }
+
         while !data.is_empty() {
             let sector_start = address & !((FLASH_SECTOR_SIZE as u32) - 1);
             let sector_offset = (address - sector_start) as usize;
             let chunk_len = data.len().min(FLASH_SECTOR_SIZE - sector_offset);
-            let mut sector = vec![0xff; FLASH_SECTOR_SIZE];
 
-            self.read_sws_flash_sector(sector_start, &mut sector)?;
-            if sector[sector_offset..sector_offset + chunk_len] == data[..chunk_len] {
+            if sector_offset == 0 && chunk_len == FLASH_SECTOR_SIZE {
+                self.erase_sws_flash_sector(sector_start)?;
+                self.program_sws_flash_range(sector_start, &data[..chunk_len])?;
+                self.mark_programmed_flash_range(sector_start, chunk_len);
                 address += chunk_len as u32;
                 data = &data[chunk_len..];
                 continue;
             }
 
+            let mut current = vec![0; chunk_len];
+            self.read_sws_flash_range(address, &mut current)?;
+            if current == data[..chunk_len] {
+                address += chunk_len as u32;
+                data = &data[chunk_len..];
+                continue;
+            }
+
+            if Self::bytes_can_be_programmed_without_erase(&current, &data[..chunk_len]) {
+                self.program_sws_flash_range(address, &data[..chunk_len])?;
+                self.mark_programmed_flash_range(address, chunk_len);
+                address += chunk_len as u32;
+                data = &data[chunk_len..];
+                continue;
+            }
+
+            let mut sector = vec![0xff; FLASH_SECTOR_SIZE];
+
+            self.read_sws_flash_sector(sector_start, &mut sector)?;
             sector[sector_offset..sector_offset + chunk_len].copy_from_slice(&data[..chunk_len]);
             self.erase_sws_flash_sector(sector_start)?;
-
-            for (page_index, page) in sector.chunks(FLASH_PAGE_SIZE).enumerate() {
-                if page.iter().all(|byte| *byte == 0xff) {
-                    continue;
-                }
-                let page_address = sector_start + (page_index * FLASH_PAGE_SIZE) as u32;
-                self.program_sws_flash_page(page_address, page)?;
-            }
+            self.program_sws_flash_range(sector_start, &sector)?;
+            self.mark_programmed_flash_range(sector_start, FLASH_SECTOR_SIZE);
 
             address += chunk_len as u32;
             data = &data[chunk_len..];
         }
 
         Ok(())
+    }
+
+    fn erase_sws_flash_all(&mut self) -> Result<(), DebugProbeError> {
+        self.erase_sws_flash_all_inner()
     }
 
     fn write_sws_memory(&mut self, address: u32, data: &[u8]) -> Result<(), DebugProbeError> {
@@ -545,6 +655,7 @@ mod tests {
     use std::io::{Read, Write};
 
     use crate::architecture::tc32::TlsrSwsDebug;
+    use crate::probe::DebugProbe;
 
     use super::{TelinkSws, crc_block, crc_valid};
 
@@ -571,9 +682,12 @@ mod tests {
     fn flash_write_preserves_unwritten_sector_bytes() {
         let mut sector = vec![0xff; 4096];
         sector[0] = 0x11;
+        sector[2] = 0x00;
+        sector[3] = 0x00;
         sector[255] = 0x22;
 
         let io = MockIo::new(vec![
+            response(0x01, &[0x00, 0x00], 2),
             response(0x01, &sector[0..1024], 1024),
             response(0x01, &sector[1024..2048], 1024),
             response(0x01, &sector[2048..3072], 1024),
@@ -590,30 +704,34 @@ mod tests {
         let writes = probe.io.downcast_ref_for_test::<MockIo>().unwrap().writes();
         assert_eq!(
             payload_without_crc(&writes[0]),
-            vec![0x01, 0x00, 0x10, 0x00, 0x00, 0x04]
+            vec![0x01, 0x02, 0x10, 0x00, 0x02, 0x00]
         );
         assert_eq!(
             payload_without_crc(&writes[1]),
-            vec![0x01, 0x00, 0x14, 0x00, 0x00, 0x04]
+            vec![0x01, 0x00, 0x10, 0x00, 0x00, 0x04]
         );
         assert_eq!(
             payload_without_crc(&writes[2]),
-            vec![0x01, 0x00, 0x18, 0x00, 0x00, 0x04]
+            vec![0x01, 0x00, 0x14, 0x00, 0x00, 0x04]
         );
         assert_eq!(
             payload_without_crc(&writes[3]),
-            vec![0x01, 0x00, 0x1c, 0x00, 0x00, 0x04]
+            vec![0x01, 0x00, 0x18, 0x00, 0x00, 0x04]
         );
         assert_eq!(
             payload_without_crc(&writes[4]),
-            vec![0x03, 0x00, 0x10, 0x00]
+            vec![0x01, 0x00, 0x1c, 0x00, 0x00, 0x04]
         );
         assert_eq!(
             payload_without_crc(&writes[5]),
+            vec![0x03, 0x00, 0x10, 0x00]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[6]),
             vec![0x06, 0x00, 0x00, 0x00]
         );
 
-        let program = payload_without_crc(&writes[6]);
+        let program = payload_without_crc(&writes[7]);
         assert_eq!(&program[..4], &[0x02, 0x00, 0x10, 0x00]);
         assert_eq!(program[4], 0x11);
         assert_eq!(program[4 + 2], 0xaa);
@@ -621,10 +739,176 @@ mod tests {
         assert_eq!(program[4 + 255], 0x22);
     }
 
+    #[test]
+    fn flash_write_programs_directly_when_no_erase_is_needed() {
+        let io = MockIo::new(vec![
+            response(0x01, &[0xff, 0xff], 2),
+            response(0x02, &[], 2),
+            response(0x06, &[0x00], 1),
+        ]);
+        let mut probe = TelinkSws::from_io_for_test(io);
+
+        probe.write_sws_flash(0x1002, &[0xaa, 0xbb]).unwrap();
+
+        let writes = probe.io.downcast_ref_for_test::<MockIo>().unwrap().writes();
+        assert_eq!(
+            payload_without_crc(&writes[0]),
+            vec![0x01, 0x02, 0x10, 0x00, 0x02, 0x00]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[1]),
+            vec![0x02, 0x02, 0x10, 0x00, 0xaa, 0xbb]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[2]),
+            vec![0x06, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn flash_write_skips_matching_direct_range() {
+        let io = MockIo::new(vec![response(0x01, &[0xaa, 0xbb], 2)]);
+        let mut probe = TelinkSws::from_io_for_test(io);
+
+        probe.write_sws_flash(0x1002, &[0xaa, 0xbb]).unwrap();
+
+        let writes = probe.io.downcast_ref_for_test::<MockIo>().unwrap().writes();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            payload_without_crc(&writes[0]),
+            vec![0x01, 0x02, 0x10, 0x00, 0x02, 0x00]
+        );
+    }
+
+    #[test]
+    fn full_sector_flash_write_erases_without_reading_sector() {
+        let mut sector = vec![0xff; 4096];
+        sector[0] = 0xaa;
+        sector[4095] = 0xbb;
+
+        let io = MockIo::new(vec![
+            response(0x03, &[], 0),
+            response(0x06, &[0x00], 1),
+            response(0x02, &[], 256),
+            response(0x06, &[0x00], 1),
+            response(0x02, &[], 256),
+            response(0x06, &[0x00], 1),
+        ]);
+        let mut probe = TelinkSws::from_io_for_test(io);
+
+        probe.write_sws_flash(0x1000, &sector).unwrap();
+
+        let writes = probe.io.downcast_ref_for_test::<MockIo>().unwrap().writes();
+        assert_eq!(
+            payload_without_crc(&writes[0]),
+            vec![0x03, 0x00, 0x10, 0x00]
+        );
+        assert_eq!(
+            &payload_without_crc(&writes[2])[..4],
+            &[0x02, 0x00, 0x10, 0x00]
+        );
+        assert_eq!(
+            &payload_without_crc(&writes[4])[..4],
+            &[0x02, 0x00, 0x1f, 0x00]
+        );
+    }
+
+    #[test]
+    fn erase_all_flash_uses_programmer_command() {
+        let io = MockIo::new(vec![response(0x04, &[], 0), response(0x06, &[0x00], 1)]);
+        let mut probe = TelinkSws::from_io_for_test(io);
+
+        probe.erase_sws_flash_all().unwrap();
+
+        let writes = probe.io.downcast_ref_for_test::<MockIo>().unwrap().writes();
+        assert_eq!(
+            payload_without_crc(&writes[0]),
+            vec![0x04, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[1]),
+            vec![0x06, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn flash_write_after_erase_all_programs_without_reading_or_sector_erase() {
+        let io = MockIo::new(vec![
+            response(0x04, &[], 0),
+            response(0x06, &[0x00], 1),
+            response(0x02, &[], 2),
+            response(0x06, &[0x00], 1),
+        ]);
+        let mut probe = TelinkSws::from_io_for_test(io);
+
+        probe.erase_sws_flash_all().unwrap();
+        probe.write_sws_flash(0x1002, &[0xaa, 0xbb]).unwrap();
+
+        let writes = probe.io.downcast_ref_for_test::<MockIo>().unwrap().writes();
+        assert_eq!(
+            payload_without_crc(&writes[0]),
+            vec![0x04, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[1]),
+            vec![0x06, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[2]),
+            vec![0x02, 0x02, 0x10, 0x00, 0xaa, 0xbb]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[3]),
+            vec![0x06, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn attach_retries_activation_with_reset_recovery() {
+        let io = MockIo::new(vec![
+            response(0x00, &[0, 0, 0x62, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0], 13),
+            response(0x00, &[0; 8], 0),
+            response(0x00, &[0], 0),
+            corrupted_response(0x00, &[], 0),
+            response(0x00, &[0], 0),
+            response(0x00, &[0], 0),
+            response(0x00, &[], 0),
+        ]);
+        let mut probe = TelinkSws::from_io_for_test(io);
+        probe.attached = false;
+
+        probe.attach().unwrap();
+
+        let writes = probe.io.downcast_ref_for_test::<MockIo>().unwrap().writes();
+        assert_eq!(&payload_without_crc(&writes[0])[..2], &[0x00, 0x00]);
+        assert_eq!(&payload_without_crc(&writes[1])[..2], &[0x00, 0x02]);
+        assert_eq!(
+            payload_without_crc(&writes[2]),
+            vec![0x00, 0x03, 0x00, 0x00]
+        );
+        assert_eq!(&payload_without_crc(&writes[3])[..2], &[0x00, 0x04]);
+        assert_eq!(
+            payload_without_crc(&writes[4]),
+            vec![0x00, 0x03, 0x01, 0x00]
+        );
+        assert_eq!(
+            payload_without_crc(&writes[5]),
+            vec![0x00, 0x03, 0x00, 0x00]
+        );
+        assert_eq!(&payload_without_crc(&writes[6])[..2], &[0x00, 0x04]);
+    }
+
     fn response(command: u8, payload: &[u8], written_count: u16) -> Vec<u8> {
         let mut response = vec![command, 0, written_count as u8, (written_count >> 8) as u8];
         response.extend_from_slice(payload);
         crc_block(&response)
+    }
+
+    fn corrupted_response(command: u8, payload: &[u8], written_count: u16) -> Vec<u8> {
+        let mut packet = response(command, payload, written_count);
+        let last = packet.len() - 1;
+        packet[last] ^= 0x01;
+        packet
     }
 
     fn payload_without_crc(packet: &[u8]) -> Vec<u8> {

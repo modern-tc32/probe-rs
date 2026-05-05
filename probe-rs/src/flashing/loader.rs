@@ -8,7 +8,7 @@ use serde_yaml::Value;
 use std::io::{Read, Seek};
 use std::ops::Range;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::builder::FlashBuilder;
 use super::{DownloadOptions, FileDownloadError, FlashError, Flasher};
@@ -656,7 +656,7 @@ impl FlashLoader {
             }
         }
 
-        self.verify_direct_nvm_writes(session)?;
+        self.verify_direct_nvm_writes(session, Some(progress))?;
         self.verify_ram(session)?;
 
         Ok(())
@@ -722,7 +722,12 @@ impl FlashLoader {
             )?;
         }
 
-        self.commit_direct_nvm_writes(session)?;
+        self.commit_direct_nvm_writes(
+            session,
+            &mut options.progress,
+            options.preverify,
+            options.do_chip_erase && !did_chip_erase,
+        )?;
 
         tracing::debug!("Committing RAM!");
 
@@ -802,7 +807,7 @@ impl FlashLoader {
         }
 
         if options.verify {
-            self.verify_direct_nvm_writes(session)?;
+            self.verify_direct_nvm_writes(session, Some(&mut options.progress))?;
             self.verify_ram(session)?;
         }
 
@@ -920,50 +925,137 @@ impl FlashLoader {
         Ok(algos)
     }
 
-    fn commit_direct_nvm_writes(&self, session: &mut Session) -> Result<(), FlashError> {
-        for region in self
-            .memory_map
-            .iter()
-            .filter_map(MemoryRegion::as_nvm_region)
-        {
-            if !self.builder.has_data_in_range(&region.range) {
-                continue;
+    fn commit_direct_nvm_writes(
+        &self,
+        session: &mut Session,
+        progress: &mut FlashProgress<'_>,
+        preverify: bool,
+        do_chip_erase: bool,
+    ) -> Result<(), FlashError> {
+        let direct_regions = self.direct_nvm_regions(session.target())?;
+        if direct_regions.is_empty() {
+            return Ok(());
+        }
+
+        let program_size = self.direct_nvm_program_size(&direct_regions);
+        if program_size == 0 {
+            return Ok(());
+        }
+
+        if do_chip_erase {
+            progress.add_progress_bar(ProgressOperation::Erase, None);
+            progress.started_erasing();
+            let start = Instant::now();
+            if let Err(error) = session.tc32_erase_all_flash().map_err(FlashError::Core) {
+                progress.failed_erasing();
+                return Err(error);
             }
+            progress.sector_erased(0, start.elapsed());
+            progress.finished_erasing();
+        }
 
-            let Some(core_name) = region.cores.first() else {
-                return Err(FlashError::NoNvmCoreAccess(region.clone()));
-            };
+        progress.add_progress_bar(ProgressOperation::Program, Some(program_size));
+        progress.started_programming();
 
-            let target = session.target();
-            match Self::get_flash_algorithm_for_region(region, target, core_name, &[]) {
-                Ok(_) => continue,
-                Err(FlashError::NoFlashLoaderAlgorithmAttached { .. })
-                    if Self::supports_direct_nvm_write(target, core_name) => {}
-                Err(error) => return Err(error),
-            }
-
-            let core_index = target.core_index_by_name(core_name).unwrap();
+        for (range, core_index) in direct_regions {
             let mut core = session.core(core_index).map_err(FlashError::Core)?;
             if !core.core_halted().map_err(FlashError::Core)? {
                 core.halt(Duration::from_millis(500))
                     .map_err(FlashError::Core)?;
             }
 
-            for (address, data) in self.builder.data_in_range(&region.range) {
+            for (address, data) in self.builder.data_in_range(&range) {
                 tracing::debug!(
                     "     -- direct NVM write: {:#010X}..{:#010X} ({} bytes)",
                     address,
                     address + data.len() as u64,
                     data.len()
                 );
-                core.write(address, data).map_err(FlashError::Core)?;
+
+                if preverify {
+                    let start = Instant::now();
+                    let mut written_data = vec![0; data.len()];
+                    if let Err(error) = core
+                        .read(address, &mut written_data)
+                        .map_err(FlashError::Core)
+                    {
+                        progress.failed_programming();
+                        return Err(error);
+                    }
+                    if written_data == data {
+                        progress.page_programmed(data.len() as u64, start.elapsed());
+                        continue;
+                    }
+                }
+
+                let start = Instant::now();
+                if let Err(error) = core.write(address, data).map_err(FlashError::Core) {
+                    progress.failed_programming();
+                    return Err(error);
+                }
+                progress.page_programmed(data.len() as u64, start.elapsed());
             }
         }
 
+        progress.finished_programming();
         Ok(())
     }
 
-    fn verify_direct_nvm_writes(&self, session: &mut Session) -> Result<(), FlashError> {
+    fn verify_direct_nvm_writes(
+        &self,
+        session: &mut Session,
+        mut progress: Option<&mut FlashProgress<'_>>,
+    ) -> Result<(), FlashError> {
+        let direct_regions = self.direct_nvm_regions(session.target())?;
+        if direct_regions.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.add_progress_bar(
+                ProgressOperation::Verify,
+                Some(self.direct_nvm_program_size(&direct_regions)),
+            );
+            progress.started_verifying();
+        }
+
+        for (range, core_index) in direct_regions {
+            let mut core = session.core(core_index).map_err(FlashError::Core)?;
+
+            for (address, data) in self.builder.data_in_range(&range) {
+                let start = Instant::now();
+                let mut written_data = vec![0; data.len()];
+                if let Err(error) = core
+                    .read(address, &mut written_data)
+                    .map_err(FlashError::Core)
+                {
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.failed_verifying();
+                    }
+                    return Err(error);
+                }
+
+                if data != &written_data {
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.failed_verifying();
+                    }
+                    return Err(FlashError::Verify);
+                }
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.page_verified(data.len() as u64, start.elapsed());
+                }
+            }
+        }
+
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.finished_verifying();
+        }
+        Ok(())
+    }
+
+    fn direct_nvm_regions(&self, target: &Target) -> Result<Vec<(Range<u64>, usize)>, FlashError> {
+        let mut direct_regions = Vec::new();
+
         for region in self
             .memory_map
             .iter()
@@ -977,7 +1069,6 @@ impl FlashLoader {
                 return Err(FlashError::NoNvmCoreAccess(region.clone()));
             };
 
-            let target = session.target();
             match Self::get_flash_algorithm_for_region(region, target, core_name, &[]) {
                 Ok(_) => continue,
                 Err(FlashError::NoFlashLoaderAlgorithmAttached { .. })
@@ -985,21 +1076,21 @@ impl FlashLoader {
                 Err(error) => return Err(error),
             }
 
-            let core_index = target.core_index_by_name(core_name).unwrap();
-            let mut core = session.core(core_index).map_err(FlashError::Core)?;
-
-            for (address, data) in self.builder.data_in_range(&region.range) {
-                let mut written_data = vec![0; data.len()];
-                core.read(address, &mut written_data)
-                    .map_err(FlashError::Core)?;
-
-                if data != &written_data {
-                    return Err(FlashError::Verify);
-                }
-            }
+            direct_regions.push((
+                region.range.clone(),
+                target.core_index_by_name(core_name).unwrap(),
+            ));
         }
 
-        Ok(())
+        Ok(direct_regions)
+    }
+
+    fn direct_nvm_program_size(&self, direct_regions: &[(Range<u64>, usize)]) -> u64 {
+        direct_regions
+            .iter()
+            .flat_map(|(range, _)| self.builder.data_in_range(range))
+            .map(|(_, data)| data.len() as u64)
+            .sum()
     }
 
     fn supports_direct_nvm_write(target: &Target, core_name: &str) -> bool {
