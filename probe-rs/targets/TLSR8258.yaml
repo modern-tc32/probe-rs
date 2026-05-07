@@ -8,6 +8,9 @@ variants:
   - name: main
     type: tc32
     core_access_options: !Tc32
+  rtt_scan_ranges:
+  - start: 0x00840000
+    end: 0x00850000
   memory_map:
   - !Nvm
     range:
