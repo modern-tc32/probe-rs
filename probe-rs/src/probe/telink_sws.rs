@@ -23,6 +23,7 @@ use crate::{
 
 const DEFAULT_UART_BAUD: u32 = 230_400;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const TRANSPORT_OPEN_SETTLE: Duration = Duration::from_millis(200);
 const DEFAULT_SWIRE_CONFIG: [u8; 6] = [0x5a, 0x00, 0x06, 0x02, 0x00, 0x05];
 const FLASH_SECTOR_SIZE: usize = 4096;
 const FLASH_PAGE_SIZE: usize = 256;
@@ -42,20 +43,26 @@ const CMDF_SWIRE_ACTIVATE: u8 = 4;
 const ERR_NONE: u8 = 0;
 
 #[cfg(not(test))]
-trait Io: Read + Write + Send {}
+trait Io: Read + Write + Send {
+    fn settle_after_open(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 
-#[cfg(not(test))]
-impl<T: Read + Write + Send> Io for T {}
+    fn discard_pending_input(&mut self) -> std::io::Result<usize> {
+        Ok(0)
+    }
+}
 
 #[cfg(test)]
 trait Io: Read + Write + Send + Any {
     fn as_any(&self) -> &dyn Any;
-}
 
-#[cfg(test)]
-impl<T: Read + Write + Send + Any> Io for T {
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn settle_after_open(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn discard_pending_input(&mut self) -> std::io::Result<usize> {
+        Ok(0)
     }
 }
 
@@ -63,6 +70,61 @@ impl<T: Read + Write + Send + Any> Io for T {
 impl dyn Io {
     fn downcast_ref_for_test<T: Any>(&self) -> Option<&T> {
         self.as_any().downcast_ref::<T>()
+    }
+}
+
+struct TcpIo(TcpStream);
+
+impl Read for TcpIo {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for TcpIo {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[cfg(not(test))]
+impl Io for TcpIo {
+    fn settle_after_open(&mut self) -> std::io::Result<()> {
+        std::thread::sleep(TRANSPORT_OPEN_SETTLE);
+        let _ = self.discard_pending_input()?;
+        Ok(())
+    }
+
+    fn discard_pending_input(&mut self) -> std::io::Result<usize> {
+        self.0.set_nonblocking(true)?;
+        let mut discarded = 0usize;
+        let mut buf = [0u8; 256];
+
+        loop {
+            match self.0.read(&mut buf) {
+                Ok(0) => break,
+                Ok(len) => discarded += len,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    self.0.set_nonblocking(false)?;
+                    return Err(error);
+                }
+            }
+        }
+
+        self.0.set_nonblocking(false)?;
+        Ok(discarded)
+    }
+}
+
+#[cfg(test)]
+impl Io for TcpIo {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -123,7 +185,8 @@ impl TelinkSws {
             stream
                 .set_write_timeout(Some(DEFAULT_IO_TIMEOUT))
                 .map_err(DebugProbeError::Usb)?;
-            Box::new(stream)
+            stream.set_nodelay(true).map_err(DebugProbeError::Usb)?;
+            Box::new(TcpIo(stream))
         } else {
             let port = serialport::new(endpoint, DEFAULT_UART_BAUD)
                 .dtr_on_open(false)
@@ -135,7 +198,7 @@ impl TelinkSws {
             Box::new(SerialIo(port))
         };
 
-        Ok(Self {
+        let mut probe = Self {
             endpoint: endpoint.to_string(),
             io,
             speed_khz: 960,
@@ -143,7 +206,11 @@ impl TelinkSws {
             io_retries: 3,
             flash_erased: false,
             programmed_flash_ranges: Vec::new(),
-        })
+        };
+
+        probe.io.settle_after_open().map_err(DebugProbeError::Usb)?;
+
+        Ok(probe)
     }
 
     #[cfg(test)]
@@ -164,10 +231,79 @@ impl TelinkSws {
         for _ in 0..=self.io_retries {
             match self.command_once(request, expected_len) {
                 Ok(response) => return Ok(response),
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    let _ = self.io.discard_pending_input();
+                    last_error = Some(error);
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| DebugProbeError::Other("SWS command failed".to_string())))
+    }
+
+    fn read_io(&mut self, buf: &mut [u8]) -> Result<usize, DebugProbeError> {
+        self.io.read(buf).map_err(|error| match error.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                DebugProbeError::Timeout
+            }
+            _ => DebugProbeError::Usb(error),
+        })
+    }
+
+    fn read_exact_response(
+        &mut self,
+        buf: &mut [u8],
+        expected_command: u8,
+    ) -> Result<(), DebugProbeError> {
+        let mut filled = 0usize;
+
+        while filled < buf.len() {
+            let read = self.read_io(&mut buf[filled..])?;
+            if read == 0 {
+                return Err(DebugProbeError::Timeout);
+            }
+
+            if filled == 0 {
+                if let Some(start) = buf[..read]
+                    .iter()
+                    .position(|byte| *byte == expected_command)
+                {
+                    if start > 0 {
+                        tracing::debug!(
+                            "Discarding {} leading Telink SWS byte(s) before command 0x{expected_command:02x}",
+                            start
+                        );
+                        buf.copy_within(start..read, 0);
+                        filled = read - start;
+                    } else {
+                        filled = read;
+                    }
+                } else {
+                    tracing::debug!(
+                        "Discarding {} unexpected Telink SWS byte(s) before command 0x{expected_command:02x}",
+                        read
+                    );
+                    continue;
+                }
+            } else {
+                filled += read;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), DebugProbeError> {
+        let mut filled = 0usize;
+
+        while filled < buf.len() {
+            let read = self.read_io(&mut buf[filled..])?;
+            if read == 0 {
+                return Err(DebugProbeError::Timeout);
+            }
+            filled += read;
+        }
+
+        Ok(())
     }
 
     fn command_once(
@@ -180,14 +316,7 @@ impl TelinkSws {
         self.io.flush().map_err(DebugProbeError::Usb)?;
 
         let mut response = vec![0u8; expected_len];
-        self.io
-            .read_exact(&mut response)
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                    DebugProbeError::Timeout
-                }
-                _ => DebugProbeError::Usb(error),
-            })?;
+        self.read_exact_response(&mut response, request[0])?;
 
         if !crc_valid(&response) {
             return Err(DebugProbeError::Other(
@@ -255,16 +384,12 @@ impl TelinkSws {
         self.io.flush().map_err(DebugProbeError::Usb)?;
 
         let mut header = [0u8; 6];
-        self.io
-            .read_exact(&mut header)
-            .map_err(DebugProbeError::Usb)?;
+        self.read_exact_response(&mut header, request[0])?;
         let payload_len = u16::from_le_bytes([header[2], header[3]]) as usize;
         let mut response = header.to_vec();
         if payload_len > 0 {
             let mut payload = vec![0u8; payload_len];
-            self.io
-                .read_exact(&mut payload)
-                .map_err(DebugProbeError::Usb)?;
+            self.read_exact_bytes(&mut payload)?;
             response.extend_from_slice(&payload);
         }
         if !crc_valid(&response) {
@@ -624,6 +749,31 @@ impl Write for SerialIo {
     }
 }
 
+#[cfg(not(test))]
+impl Io for SerialIo {
+    fn settle_after_open(&mut self) -> std::io::Result<()> {
+        std::thread::sleep(TRANSPORT_OPEN_SETTLE);
+        self.0
+            .clear(serialport::ClearBuffer::All)
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn discard_pending_input(&mut self) -> std::io::Result<usize> {
+        self.0
+            .clear(serialport::ClearBuffer::Input)
+            .map_err(std::io::Error::other)?;
+        Ok(0)
+    }
+}
+
+#[cfg(test)]
+impl Io for SerialIo {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 fn crc16(data: &[u8]) -> [u8; 2] {
     let mut crc = 0xffffu16;
     for value in data {
@@ -652,12 +802,13 @@ fn crc_valid(data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
     use std::io::{Read, Write};
 
     use crate::architecture::tc32::TlsrSwsDebug;
     use crate::probe::DebugProbe;
 
-    use super::{TelinkSws, crc_block, crc_valid};
+    use super::{Io, TelinkSws, crc_block, crc_valid};
 
     #[test]
     fn crc_block_matches_tlsr_programmer_get_version_packet() {
@@ -898,6 +1049,20 @@ mod tests {
         assert_eq!(&payload_without_crc(&writes[6])[..2], &[0x00, 0x04]);
     }
 
+    #[test]
+    fn get_version_discards_leading_transport_ff() {
+        let io = MockIo::new(vec![
+            vec![0xff],
+            response(0x00, &[0, 0, 0x62, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0], 13),
+        ]);
+        let mut probe = TelinkSws::from_io_for_test(io);
+
+        let version = probe.get_version().unwrap();
+
+        assert_eq!(version[0], 0x00);
+        assert_eq!(&version[4..8], &[0x00, 0x00, 0x62, 0x55]);
+    }
+
     fn response(command: u8, payload: &[u8], written_count: u16) -> Vec<u8> {
         let mut response = vec![command, 0, written_count as u8, (written_count >> 8) as u8];
         response.extend_from_slice(payload);
@@ -950,6 +1115,12 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    impl Io for MockIo {
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 }
